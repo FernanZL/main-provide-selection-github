@@ -16,41 +16,111 @@ if TYPE_CHECKING:
 
 
 class MCDAEngine:
-    def __init__(self, methods=("weighted", "topsis", "vikor", "waspas"), first_visit_threshold: float = 80.0,):
+    def __init__(
+        self,
+        methods=("weighted", "topsis", "vikor", "waspas"),
+        first_visit_threshold: float = 90.0,
+    ):
         self.methods = set(methods)
 
-        # Business rule: below this % first_visit is "bad".
-        # Used as neutral imputation for missing first_visit values in MCDA.
+        # Business rule: below this % first_visit / delivery is "bad".
+        # Used as neutral imputation for missing values in MCDA.
         self.first_visit_threshold = float(first_visit_threshold)
 
-        # Presets focused on (first_visit, cost, coverage)
-        # You can tune these numbers later if you want.
-        self.weight_presets: dict[str, dict[str, float]] = {
-            # Everything equally important
-            "balanced": {
-                "first_visit": 1 / 3,
-                "cost": 1 / 3,
-                "coverage": 1 / 3,
-            },
-            # Similar to what you were using (0.5, 0.4, 0.1)
-            "quality_over_cost": {
-                "first_visit": 0.5,
-                "cost": 0.4,
-                "coverage": 0.1,
-            },
-            # Push cost harder, still keep some service and coverage
-            "cost_focus": {
-                "first_visit": 0.25,
-                "cost": 0.55,
-                "coverage": 0.20,
-            },
-            # Super strict on service quality, cost is secondary
-            "service_first": {
-                "first_visit": 0.6,
-                "cost": 0.25,
-                "coverage": 0.15,
-            },
-        }
+        # Presets focused on (first_visit, cost, coverage, delivery and sla)
+        self.weight_presets = {
+
+    # 1) Fully balanced across all 5 criteria
+    "balanced": {
+        "first_visit": 0.20,
+        "cost":        0.20,
+        "coverage":    0.20,
+        "delivery":    0.20,
+        "sla":         0.20,
+    },
+
+    # 2) Prioritize full service (1era visita + entrega + SLA)
+    "service_quality": {
+        "first_visit": 0.28,
+        "cost":        0.15,
+        "coverage":    0.12,
+        "delivery":    0.25,
+        "sla":         0.20,
+    },
+
+    # 3) Cost is the main driver
+    "cost_focus": {
+        "first_visit": 0.12,
+        "cost":        0.50,
+        "coverage":    0.10,
+        "delivery":    0.13,
+        "sla":         0.15,
+    },
+
+    # 4) Expand coverage nationally
+    "coverage_focus": {
+        "first_visit": 0.12,
+        "cost":        0.12,
+        "coverage":    0.50,
+        "delivery":    0.13,
+        "sla":         0.13,
+    },
+
+    # 5) Reliability (delivery + SLA) as top priority
+    "reliability_first": {
+        "first_visit": 0.16,
+        "cost":        0.10,
+        "coverage":    0.10,
+        "delivery":    0.32,
+        "sla":         0.32,
+    },
+
+    # 6) Strict service: 1era visita & entrega more important than cost
+    "service_strict": {
+        "first_visit": 0.35,
+        "cost":        0.05,
+        "coverage":    0.10,
+        "delivery":    0.30,
+        "sla":         0.20,
+    },
+
+    # 7) SLA-focused (predictability/time commitments)
+    "sla_priority": {
+        "first_visit": 0.15,
+        "cost":        0.10,
+        "coverage":    0.10,
+        "delivery":    0.20,
+        "sla":         0.45,
+    },
+
+    # 8) Premium shipping (fast and reliable, cost less relevant)
+    "premium_shipping": {
+        "first_visit": 0.22,
+        "cost":        0.10,
+        "coverage":    0.08,
+        "delivery":    0.30,
+        "sla":         0.30,
+    },
+
+    # 9) Startup scaling mode: reach + price
+    "startup_scaling": {
+        "first_visit": 0.10,
+        "cost":        0.35,
+        "coverage":    0.35,
+        "delivery":    0.10,
+        "sla":         0.10,
+    },
+
+    # 10) Lpractical mix (good real-world baseline)
+    "practical": {
+        "first_visit": 0.22,
+        "cost":        0.33,
+        "coverage":    0.15,
+        "delivery":    0.18,
+        "sla":         0.12,
+    },
+}
+
 
     @property
     def available_weight_presets(self) -> list[str]:
@@ -69,6 +139,7 @@ class MCDAEngine:
         features: Optional[Sequence[str]] = None,
         feature_builder: Optional["FeatureBuilder"] = None,
         weights_preset: Optional[str] = None,
+        smooth_approximation: bool = False,  # <--- NEW FLAG
     ):
         """
         Compute MCDA scores for the given DataFrame.
@@ -98,10 +169,15 @@ class MCDAEngine:
             Explicit list of feature/criteria column names to use (subset and/or ordering).
             If None, all df_metrics columns are used.
         feature_builder : FeatureBuilder, optional (keyword-only)
-            FeatureBuilder instance used to infer criteria_types when criteria_types is None.
+            FeatureBuilder instance used to infer criteria_types and read
+            global μ for first_visit / delivery when doing business-rule imputation.
         weights_preset : str, optional (keyword-only)
             Name of a predefined weight preset (focused on first_visit, cost, coverage).
             Mutually exclusive with `weights`.
+        smooth_approximation : bool, optional (keyword-only)
+            If True, use cached cubic smooth approximation for first_visit / delivery
+            business-rule transform (no kink). If False (default), use the original
+            piecewise-linear soft-ReLU with kink.
         """
 
         df_all = df_metrics.copy()
@@ -196,13 +272,31 @@ class MCDAEngine:
             raise ValueError("After dropping NaN-only criteria, all weights became zero.")
         weights_arr = weights_arr / weights_arr.sum()
 
-        # ---- run each MCDA method ----
+        # ---- NEW: get global μ_first_visit / μ_delivery from FeatureBuilder if available ----
+        mu_global_first_visit = None
+        mu_global_delivery = None
+        if feature_builder is not None:
+            if hasattr(feature_builder, "first_visit_mu_global"):
+                mu_global_first_visit = feature_builder.first_visit_mu_global
+            if hasattr(feature_builder, "delivery_mu_global"):
+                mu_global_delivery = feature_builder.delivery_mu_global
+
+        # ---- NEW: apply business-rule imputation ONCE (for first_visit & delivery) ----
+        data_imputed = self._impute_with_business_rule(
+            df,
+            cols,
+            mu_global_first_visit=mu_global_first_visit,
+            mu_global_delivery=mu_global_delivery,
+            smooth_approximation=smooth_approximation,  # <--- PASS FLAG THROUGH
+        )
+
+        # ---- run each MCDA method (assume df already imputed) ----
         results = {}
         for m in methods:
             if m not in self.methods:
                 raise ValueError(f"Unknown method '{m}'")
             func = getattr(self, f"_{m}")
-            score = func(df, cols, weights_arr, criteria_types)
+            score = func(data_imputed, cols, weights_arr, criteria_types)
             results[f"Score_{m}"] = score
 
         # ---- build output ----
@@ -217,62 +311,269 @@ class MCDAEngine:
 
         return df_out if return_df else results[list(results.keys())[0]]
 
-    def _impute_with_business_rule(self, df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    def _impute_with_business_rule(
+        self,
+        df: pd.DataFrame,
+        cols: list[str],
+        mu_global_first_visit: float | None = None,
+        mu_global_delivery: float | None = None,
+        smooth_approximation: bool = False,
+    ) -> pd.DataFrame:
         """
-        Return df[cols] with NaNs imputed and first_visit transformed to [0, 1].
+        Return df[cols] with NaNs imputed and first_visit / delivery
+        transformed to [0, 1].
 
-        - 'first_visit' (assumed in %: 0..100):
+        Assumes df is the feature matrix for ONE provincia.
+
+        For 'first_visit' and 'delivery' (assumed in %: 0..100):
             * Convert to rate r in [0,1].
-            * Piecewise transform with threshold t (e.g. 0.8):
-                - r <= t: y = low_band_max * (r / t)
-                - r  > t: y = low_band_max + (1 - low_band_max) * (r - t) / (1 - t)
-            where low_band_max is the max score for the "bad" region (e.g. 0.2).
-            * NaNs are filled with `nan_fill` (in [0,1], e.g. 0.6 = mid of the good region).
+            * t_global = self.first_visit_threshold / 100.
+            * μ_prov = mean r in this df (per courier matrix).
+            * If corresponding global μ is provided (from FeatureBuilder):
+                  μ_global = mu_global_*
+                  Δ = μ_global - t_global
+                  t_prov = clip(μ_prov - Δ, [0.6, 0.95])
+              else:
+                  t_prov = t_global
+            * If smooth_approximation is False (default):
+                  Soft-ReLU with kink (piecewise linear) and low_band_max:
+                      if r <= t_prov:
+                          y = low_band_max * (r / t_prov)
+                      else:
+                          y = low_band_max + (1 - low_band_max) * (r - t_prov) / (1 - t_prov)
+              NaNs are filled (in score space) with:
+                  r_nan = t_prov + alpha * (μ_prov - t_prov), alpha = 0.25
+                  nan_fill = soft_relu(r_nan, t_prov)
+            * If smooth_approximation is True:
+                  Use a cached cubic smoothing of the same soft-ReLU shape
+                  (no kink) built once per provincia for each metric.
 
-        - Other criteria:
-            * NaNs filled with midpoint (min + max) / 2, or 0 if the column is fully missing.
+              If there is no info at all, fall back to 0.5.
+
+        Other criteria:
+            * NaNs filled with midpoint (min + max)/2, or 0 if the column is fully missing.
         """
         data = df[cols].copy()
 
-        # --- Parameters for first_visit transform ---
-        thr_pct = float(self.first_visit_threshold)  # e.g. 80.0
-        t = thr_pct / 100.0                          # threshold in [0,1], e.g. 0.8
-        low_band_max = 0.2                           # "bad" region lives in [0, 0.2]
-        #nan_fill = (low_band_max + 1.0) / 2.0        # mid of good region [0.2,1] -> 0.6
-        nan_fill = 0.2
+        # --- Global params for transforms ---
+        t_global = float(self.first_visit_threshold) / 100.0  # e.g. 0.9
+        low_band_max = 0.35
+        alpha = 0.25
+        nan_fill_default = 0.5
 
+        def _soft_relu_scalar(r_val: float, t_val: float) -> float:
+            if pd.isna(r_val) or pd.isna(t_val):
+                return nan_fill_default
+            t_safe = min(max(float(t_val), 1e-6), 1.0 - 1e-6)
+            r_safe = float(r_val)
+            if r_safe <= t_safe:
+                return low_band_max * (r_safe / t_safe)
+            else:
+                denom = max(1.0 - t_safe, 1e-9)
+                return low_band_max + (1.0 - low_band_max) * ((r_safe - t_safe) / denom)
+
+        def _build_soft_relu_cubic(t_val: float, band_width: float = 0.10):
+            """
+            Build a reusable smooth soft-ReLU (cached cubic) for a given threshold t_val.
+            Returns a function f(r_array) -> scores, vectorized over r.
+            """
+            t_safe = min(max(float(t_val), 1e-6), 1.0 - 1e-6)
+            L = float(low_band_max)
+
+            # Slopes of the original linear pieces
+            m_left = L / t_safe
+            m_right = (1.0 - L) / (1.0 - t_safe)
+
+            # Band around threshold where we smooth
+            left = max(t_safe - band_width, 0.0)
+            right = min(t_safe + band_width, 1.0)
+
+            # Values of the original function at band edges
+            y_left = L * (left / t_safe)
+            y_right = L + (1.0 - L) * ((right - t_safe) / (1.0 - t_safe))
+
+            # Solve for cubic S(r) = a r^3 + b r^2 + c r + d
+            M = np.array([
+                [left**3,    left**2,  left,  1.0],
+                [3*left**2,  2*left,   1.0,   0.0],
+                [right**3,   right**2, right, 1.0],
+                [3*right**2, 2*right,  1.0,   0.0],
+            ])
+            v = np.array([y_left, m_left, y_right, m_right])
+            a, b, c, d = np.linalg.solve(M, v)
+
+            def _smooth_fn(r):
+                r_arr = np.asarray(r, dtype=float)
+                out = np.empty_like(r_arr)
+
+                mask_left = r_arr <= left
+                mask_right = r_arr >= right
+                mask_mid = ~(mask_left | mask_right)
+
+                # Left linear segment
+                if mask_left.any():
+                    out[mask_left] = L * (r_arr[mask_left] / t_safe)
+
+                # Right linear segment
+                if mask_right.any():
+                    denom = max(1.0 - t_safe, 1e-9)
+                    out[mask_right] = L + (1.0 - L) * (
+                        (r_arr[mask_right] - t_safe) / denom
+                    )
+
+                # Cubic blend in the middle
+                if mask_mid.any():
+                    rm = r_arr[mask_mid]
+                    out[mask_mid] = ((a * rm + b) * rm + c) * rm + d
+
+                if np.isscalar(r):
+                    return float(out)
+                return out
+
+            return _smooth_fn
+
+        # --- FIRST_VISIT params per province ---
+        t_prov_first = t_global
+        nan_fill_first_visit = nan_fill_default
+        soft_fn_first = None  # cached cubic smoother for first_visit (if used)
+
+        if "first_visit" in cols:
+            vals_all = data["first_visit"]
+            valid_all = vals_all.dropna()
+
+            if not valid_all.empty:
+                r_all = (valid_all / 100.0).clip(0.0, 1.0)
+                mu_prov = float(r_all.mean())
+
+                if mu_global_first_visit is not None and not np.isnan(mu_global_first_visit):
+                    mu_global = float(mu_global_first_visit)
+                    delta = mu_global - t_global
+                    t_prov_first = float(np.clip(mu_prov - delta, 0.6, 0.95))
+                else:
+                    t_prov_first = t_global
+
+                r_nan = t_prov_first + alpha * (mu_prov - t_prov_first)
+
+                if smooth_approximation:
+                    # Build smoother once for this provincia / metric
+                    soft_fn_first = _build_soft_relu_cubic(t_prov_first)
+                    # Simple rule: use r_nan in rate space, then smooth it
+                    nan_fill_first_visit = float(soft_fn_first(r_nan))
+                else:
+                    nan_fill_first_visit = _soft_relu_scalar(r_nan, t_prov_first)
+            else:
+                t_prov_first = t_global
+                nan_fill_first_visit = nan_fill_default
+
+        # --- DELIVERY params per province (similar to first_visit) ---
+        t_prov_delivery = t_global
+        nan_fill_delivery = nan_fill_default
+        soft_fn_delivery = None  # cached cubic smoother for delivery (if used)
+
+        if "delivery" in cols:
+            vals_all = data["delivery"]
+            valid_all = vals_all.dropna()
+
+            if not valid_all.empty:
+                r_all = (valid_all / 100.0).clip(0.0, 1.0)
+                mu_prov = float(r_all.mean())
+
+                if mu_global_delivery is not None and not np.isnan(mu_global_delivery):
+                    mu_global = float(mu_global_delivery)
+                    delta = mu_global - t_global
+                    t_prov_delivery = float(np.clip(mu_prov - delta, 0.6, 0.95))
+                else:
+                    t_prov_delivery = t_global
+
+                r_nan = t_prov_delivery + alpha * (mu_prov - t_prov_delivery)
+
+                if smooth_approximation:
+                    soft_fn_delivery = _build_soft_relu_cubic(t_prov_delivery)
+                    nan_fill_delivery = float(soft_fn_delivery(r_nan))
+                else:
+                    nan_fill_delivery = _soft_relu_scalar(r_nan, t_prov_delivery)
+            else:
+                t_prov_delivery = t_global
+                nan_fill_delivery = nan_fill_default
+
+        # --- Main loop over columns ---
         for col in cols:
             vals = data[col]
 
             if col == "first_visit":
                 valid = vals.dropna()
+
                 if not valid.empty:
-                    # 1) convert % -> rate in [0,1]
                     r = (valid / 100.0).clip(0.0, 1.0)
 
-                    y = pd.Series(index=valid.index, dtype=float)
+                    if smooth_approximation and soft_fn_first is not None:
+                        # Use cached cubic smoother
+                        y_vals = soft_fn_first(r.values)
+                        y = pd.Series(y_vals, index=valid.index, dtype=float)
+                        data.loc[valid.index, col] = y
+                    else:
+                        # Original piecewise (with kink)
+                        y = pd.Series(index=valid.index, dtype=float)
+                        t_safe = min(max(t_prov_first, 1e-6), 1.0 - 1e-6)
 
-                    # bad region: r <= t -> [0, low_band_max]
-                    mask_bad = r <= t
-                    if mask_bad.any():
-                        y.loc[mask_bad] = low_band_max * (r.loc[mask_bad] / max(t, 1e-9))
+                        # bad region: r <= t_prov_first → [0, low_band_max]
+                        mask_bad = r <= t_safe
+                        if mask_bad.any():
+                            y.loc[mask_bad] = low_band_max * (r[mask_bad] / t_safe)
 
-                    # good region: r > t -> [low_band_max, 1]
-                    mask_good = r > t
-                    if mask_good.any():
-                        y.loc[mask_good] = (
-                            low_band_max
-                            + (1.0 - low_band_max)
-                            * ((r.loc[mask_good] - t) / max(1.0 - t, 1e-9))
-                        )
+                        # good region: r > t_prov_first → [low_band_max, 1]
+                        mask_good = ~mask_bad
+                        if mask_good.any():
+                            denom_good = max(1.0 - t_safe, 1e-9)
+                            y.loc[mask_good] = (
+                                low_band_max
+                                + (1.0 - low_band_max)
+                                * ((r[mask_good] - t_safe) / denom_good)
+                            )
 
-                    data.loc[valid.index, col] = y
+                        data.loc[valid.index, col] = y
 
-                # 2) NaNs in first_visit -> business neutral in the *transformed* [0,1] scale
-                data[col] = data[col].astype(float).fillna(nan_fill)
+                # Fill NaNs with the province-specific neutral score
+                data[col] = data[col].astype(float).fillna(nan_fill_first_visit)
+
+            elif col == "delivery":
+                valid = vals.dropna()
+
+                if not valid.empty:
+                    r = (valid / 100.0).clip(0.0, 1.0)
+
+                    if smooth_approximation and soft_fn_delivery is not None:
+                        # Use cached cubic smoother
+                        y_vals = soft_fn_delivery(r.values)
+                        y = pd.Series(y_vals, index=valid.index, dtype=float)
+                        data.loc[valid.index, col] = y
+                    else:
+                        # Original piecewise (with kink)
+                        y = pd.Series(index=valid.index, dtype=float)
+                        t_safe = min(max(t_prov_delivery, 1e-6), 1.0 - 1e-6)
+
+                        # bad region: r <= t_prov_delivery → [0, low_band_max]
+                        mask_bad = r <= t_safe
+                        if mask_bad.any():
+                            y.loc[mask_bad] = low_band_max * (r[mask_bad] / t_safe)
+
+                        # good region: r > t_prov_delivery → [low_band_max, 1]
+                        mask_good = ~mask_bad
+                        if mask_good.any():
+                            denom_good = max(1.0 - t_safe, 1e-9)
+                            y.loc[mask_good] = (
+                                low_band_max
+                                + (1.0 - low_band_max)
+                                * ((r[mask_good] - t_safe) / denom_good)
+                            )
+
+                        data.loc[valid.index, col] = y
+
+                # Fill NaNs with the province-specific neutral score
+                data[col] = data[col].astype(float).fillna(nan_fill_delivery)
 
             else:
-                # old logic: midpoint neutral imputation for other criteria
+                # generic midpoint neutral for other criteria
                 valid = vals.dropna()
                 if not valid.empty:
                     neutral = (valid.min() + valid.max()) / 2.0
@@ -283,29 +584,23 @@ class MCDAEngine:
         return data
 
 
-
-
     # -------------- MCDA methods --------------
 
     def _topsis(self, df, cols, weights, criteria_types):
         """
         TOPSIS via pymcdm.
 
-        Automatically handles:
-        - NaN imputation using:
-            * first_visit → threshold-normalized [0,1] + NaNs→0.5
-            * others → midpoint neutral
-        - Benefit/cost mapping
-        - Constant-criteria removal (no variation)
+        Assumes:
+        - df[cols] already business-rule imputed (first_visit / delivery in [0,1])
+          by _impute_with_business_rule.
         """
-        data = self._impute_with_business_rule(df, cols)
+        data = df[cols].copy()
 
         X = data.to_numpy(dtype=float)
         w = np.asarray(weights, dtype=float)
         type_map = {"benefit": 1, "cost": -1}
         types = np.array([type_map[ct] for ct in criteria_types], dtype=int)
 
-        # (rest of your existing TOPSIS code unchanged)
         const_mask = np.std(X, axis=0) > 1e-12
         if const_mask.sum() == 0:
             score = pd.Series(np.ones(X.shape[0]), index=df.index, name="Score_topsis")
@@ -321,16 +616,15 @@ class MCDAEngine:
         score = pd.Series(prefs, index=df.index, name="Score_topsis")
         return score
 
-
     def _weighted(self, df, cols, weights, criteria_types):
         """
         Weighted Sum (WSM / SAW) via pymcdm.
 
-        Uses:
-        - first_visit → threshold-normalized [0,1] + NaNs→0.5
-        - others → midpoint neutral
+        Assumes:
+        - df[cols] already business-rule imputed (first_visit / delivery in [0,1])
+          by _impute_with_business_rule.
         """
-        data = self._impute_with_business_rule(df, cols)
+        data = df[cols].copy()
 
         X = data.to_numpy(dtype=float)
         w = np.asarray(weights, dtype=float)
@@ -352,7 +646,6 @@ class MCDAEngine:
         score = pd.Series(prefs, index=df.index, name="Score_weighted")
         return score
 
-
     def _vikor(
         self,
         df,
@@ -363,12 +656,13 @@ class MCDAEngine:
         explain: bool = False,
     ):
         """
-        VIKOR via pymcdm, with:
-        - first_visit → threshold-normalized [0,1] + NaNs→0.5
-        - others → midpoint neutral
-        - automatic removal of constant criteria.
+        VIKOR via pymcdm.
+
+        Assumes:
+        - df[cols] already business-rule imputed (first_visit / delivery in [0,1])
+          by _impute_with_business_rule.
         """
-        data = self._impute_with_business_rule(df, cols)
+        data = df[cols].copy()
 
         X = data.to_numpy(dtype=float)
         w = np.asarray(weights, dtype=float)
@@ -420,7 +714,7 @@ class MCDAEngine:
         if explain:
             print(
                 "VIKOR computed via pymcdm.VIKOR (0→best flipped to 1→best). "
-                "NaNs handled with threshold-normalized first_visit."
+                "NaNs handled with business-rule transforms (first_visit / delivery)."
             )
 
         if return_details:
@@ -428,16 +722,15 @@ class MCDAEngine:
 
         return score
 
-
     def _waspas(self, df, cols, weights, criteria_types):
         """
         WASPAS via pymcdm.
 
-        Uses:
-        - first_visit → threshold-normalized [0,1] + NaNs→0.5
-        - others → midpoint neutral
+        Assumes:
+        - df[cols] already business-rule imputed (first_visit / delivery in [0,1])
+          by _impute_with_business_rule.
         """
-        data = self._impute_with_business_rule(df, cols)
+        data = df[cols].copy()
 
         X = data.to_numpy(dtype=float)
         w = np.asarray(weights, dtype=float)

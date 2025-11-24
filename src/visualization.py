@@ -18,7 +18,7 @@ class ShippingVisualizer:
     def plot_features_company_province(
         cleaned_df: pd.DataFrame,
         fb: FeatureBuilder,
-        courier: str,
+        carrier: str,
         x_feature: str = "first_visit",
         y_feature: str = "cost",
         provincias: list[str] | None = None,
@@ -28,7 +28,7 @@ class ShippingVisualizer:
         ax: Optional[plt.Axes] = None,
     ) -> plt.Axes:
         """
-        Scatter plot of two features (x_feature, y_feature) for a single courier,
+        Scatter plot of two features (x_feature, y_feature) for a single carrier,
         with one dot per Provincia.
 
         Features are computed via FeatureBuilder.build() for each Provincia.
@@ -39,7 +39,7 @@ class ShippingVisualizer:
             Cleaned dataset (the same one you pass to FeatureBuilder).
         fb : FeatureBuilder
             An instance of FeatureBuilder already configured.
-        courier : str
+        carrier : str
             Short provider name (one of fb.proveedores_short).
             This is the index label in the feature DataFrames.
         x_feature : str, default 'first_visit'
@@ -84,7 +84,7 @@ class ShippingVisualizer:
         ys: list[float] = []
         labels: list[str] = []
 
-        # --- For each provincia, compute features and pick the courier's values ---
+        # --- For each provincia, compute features and pick the carrier's values ---
         for prov in provincias:
             try:
                 feat_df = fb.build(
@@ -101,11 +101,11 @@ class ShippingVisualizer:
             if feat_df is None or feat_df.empty:
                 continue
 
-            # If this courier is not present (all NaN etc.), skip
-            if courier not in feat_df.index:
+            # If this carrier is not present (all NaN etc.), skip
+            if carrier not in feat_df.index:
                 continue
 
-            row = feat_df.loc[courier]
+            row = feat_df.loc[carrier]
 
             x_val = row.get(x_feature, np.nan)
             y_val = row.get(y_feature, np.nan)
@@ -124,7 +124,7 @@ class ShippingVisualizer:
                 fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
             ax.text(
                 0.5, 0.5,
-                f"No valid data for '{courier}'",
+                f"No valid data for '{carrier}'",
                 ha="center", va="center",
                 fontsize=12, color="gray"
             )
@@ -164,7 +164,7 @@ class ShippingVisualizer:
         ax.set_xlabel(x_label, fontsize=12)
         ax.set_ylabel(y_label, fontsize=12)
         ax.set_title(
-            f"{courier}: {y_label} vs {x_label} by Provincia",
+            f"{carrier}: {y_label} vs {x_label} by Provincia",
             fontsize=14,
         )
         ax.grid(True, alpha=0.3)
@@ -188,7 +188,7 @@ class ShippingVisualizer:
         legend: bool = True,
     ) -> plt.Figure:
         """
-        Plot evolution of each courier's MCDA score across different weight presets.
+        Plot evolution of each carrier's MCDA score across different weight presets.
 
         X-axis: weight presets (e.g. 'balanced', 'quality_over_cost', ...)
         Y-axis: score from the chosen MCDA method (default: WASPAS).
@@ -335,7 +335,7 @@ class ShippingVisualizer:
         legend: bool = True,
     ) -> plt.Figure:
         """
-        Plot evolution of each courier's scores across MCDA methods.
+        Plot evolution of each carrier's scores across MCDA methods.
 
         X-axis: MCDA methods (weighted, topsis, vikor, waspas, ...)
         Y-axis: score for each method, for each provider.
@@ -489,7 +489,7 @@ class ShippingVisualizer:
         rotation: int = 45,
     ) -> plt.Figure:
         """
-        Bar plot comparing MCDA method scores for each courier (provider).
+        Bar plot comparing MCDA method scores for each carrier (provider).
 
         Uses the full pipeline:
         - FeatureBuilder.build(...) to compute metrics for a given provincia/location
@@ -613,3 +613,436 @@ class ShippingVisualizer:
         ax.grid(alpha=0.3, axis="y")
         fig.tight_layout()
         return fig
+
+    @staticmethod
+    def first_visit_barplot(
+        cleaned_df: pd.DataFrame,
+        fb: FeatureBuilder,
+        groupby: str = "provincia",  # 'provincia', 'proveedor', 'provincia_proveedor', 'proveedor_provincia'
+        provincia: str | None = None,
+        provincias: Sequence[str] | None = None,
+        proveedores: Sequence[str] | None = None,
+        location: str = "both",
+        figsize: Tuple[float, float] = (20, 10),
+        dpi: int = 120,
+        rotation: int = 45,
+        title: str | None = None,
+    ) -> plt.Figure:
+        """
+        Bar plot for the 'first_visit' feature.
+
+        Modes controlled by `groupby`:
+
+        - groupby='provincia' (default):
+            X-axis: one bar per provincia.
+            Y-axis: average first_visit across all providers in that provincia.
+
+        - groupby='proveedor':
+            X-axis: one bar per proveedor.
+            Y-axis: first_visit for each provider, optionally filtered by `provincia`.
+
+        - groupby='provincia_proveedor':
+            X-axis: provincias.
+            For each provincia, a group of bars (one per proveedor).
+
+        - groupby='proveedor_provincia':
+            X-axis: proveedores.
+            For each proveedor, a group of bars (one per provincia).
+
+        In all cases, the numeric value is annotated on top of each bar (in % if
+        data look like ratios 0–1).
+
+        Parameters
+        ----------
+        cleaned_df : pd.DataFrame
+            Cleaned dataset (input to FeatureBuilder).
+        fb : FeatureBuilder
+            FeatureBuilder instance.
+        groupby : {'provincia', 'proveedor', 'provincia_proveedor',
+                   'proveedor_provincia'}, default 'provincia'
+            Grouping mode for the X-axis.
+        provincia : str, optional
+            When groupby='proveedor', restrict metrics to a single provincia.
+            Ignored in other modes.
+        provincias : sequence of str, optional
+            When groupby in {'provincia', 'provincia_proveedor',
+            'proveedor_provincia'}, subset of provincias to include.
+            If None, uses all provincias in cleaned_df["Provincia"].
+        proveedores : sequence of str, optional
+            Subset of providers (index names in FeatureBuilder output).
+            If None, uses all that appear in the data.
+        location : {'both', 'capital', 'interior'}, default 'both'
+            Passed to FeatureBuilder.build().
+        figsize : (float, float), default (12, 6)
+            Figure size in inches.
+        dpi : int, default 120
+            Figure DPI.
+        rotation : int, default 45
+            Rotation of X-axis labels.
+        title : str, optional
+            Custom title. If None, an automatic title is used.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure object.
+        """
+
+        groupby = groupby.lower()
+        if groupby not in {
+            "provincia",
+            "proveedor",
+            "provincia_proveedor",
+            "proveedor_provincia",
+        }:
+            raise ValueError(
+                "groupby must be 'provincia', 'proveedor', "
+                "'provincia_proveedor' or 'proveedor_provincia'."
+            )
+
+        # Helper to scale to percentage if values look like ratios in [0,1]
+        def _scale_values_to_pct(raw_vals: Sequence[float]) -> tuple[list[float], bool]:
+            valid_vals = [v for v in raw_vals if v is not None and not pd.isna(v)]
+            if not valid_vals:
+                return [], False
+            max_val = max(valid_vals)
+            scale_to_pct = max_val <= 1.0 + 1e-9
+            if scale_to_pct:
+                return [float(v) * 100.0 for v in raw_vals], True
+            else:
+                return [float(v) for v in raw_vals], False
+
+        # ------------------ groupby = 'provincia' ------------------
+        if groupby == "provincia":
+            if provincias is None:
+                provincias = (
+                    cleaned_df["Provincia"]
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+                provincias = sorted(provincias)
+
+            categories: list[str] = []
+            raw_values: list[float] = []
+
+            for prov in provincias:
+                df_metrics = fb.build(
+                    df=cleaned_df,
+                    features=["first_visit"],
+                    drop_incomplete=True,
+                    provincia=prov,
+                    location=location,
+                )
+
+                if df_metrics is None or df_metrics.empty:
+                    continue
+
+                col = df_metrics["first_visit"].dropna()
+                if col.empty:
+                    continue
+
+                val = float(col.mean())
+                categories.append(str(prov))
+                raw_values.append(val)
+
+            if not categories:
+                raise ValueError(
+                    "No valid 'first_visit' data found for any provincia "
+                    "with the given filters."
+                )
+
+            plot_values, scaled = _scale_values_to_pct(raw_values)
+
+            fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+            x_pos = np.arange(len(categories))
+            ax.bar(x_pos, plot_values)
+
+            if title is None:
+                title = "First visit por provincia (promedio proveedores)"
+
+            ax.set_title(title, fontsize=14)
+            ax.set_ylabel(
+                "First visit success (%)" if scaled else "First visit",
+                fontsize=12,
+            )
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(categories, rotation=rotation, ha="right")
+
+            # annotate
+            for x, val in zip(x_pos, plot_values):
+                ax.text(
+                    x,
+                    val,
+                    f"{val:.1f}%" if scaled else f"{val:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+
+            ax.grid(alpha=0.3, axis="y")
+            fig.tight_layout()
+            return fig
+
+        # ------------------ groupby = 'proveedor' ------------------
+        if groupby == "proveedor":
+            df_metrics = fb.build(
+                df=cleaned_df,
+                features=["first_visit"],
+                drop_incomplete=True,
+                provincia=provincia,
+                location=location,
+            )
+
+            if df_metrics is None or df_metrics.empty:
+                raise ValueError(
+                    "No metrics available for the specified filters "
+                    "(provincia/location)."
+                )
+
+            series = df_metrics["first_visit"].dropna()
+
+            if proveedores is not None:
+                proveedores = list(proveedores)
+                valid_prov = [p for p in proveedores if p in series.index]
+                series = series.loc[valid_prov].dropna()
+
+            if series.empty:
+                raise ValueError(
+                    "No valid 'first_visit' data for the requested proveedores."
+                )
+
+            categories = list(series.index.astype(str))
+            raw_values = [float(v) for v in series.values]
+            plot_values, scaled = _scale_values_to_pct(raw_values)
+
+            fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+            x_pos = np.arange(len(categories))
+            ax.bar(x_pos, plot_values)
+
+            if title is None:
+                base = "First visit por proveedor"
+                if provincia is not None:
+                    base += f" – Provincia: {provincia}"
+                title = base
+
+            ax.set_title(title, fontsize=14)
+            ax.set_ylabel(
+                "First visit success (%)" if scaled else "First visit",
+                fontsize=12,
+            )
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(categories, rotation=rotation, ha="right")
+
+            for x, val in zip(x_pos, plot_values):
+                ax.text(
+                    x,
+                    val,
+                    f"{val:.1f}%" if scaled else f"{val:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+
+            ax.grid(alpha=0.3, axis="y")
+            fig.tight_layout()
+            return fig
+
+        # ----------------- common prep for 2D modes -----------------
+        # Provincias to consider
+        if provincias is None:
+            provincias = (
+                cleaned_df["Provincia"]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            provincias = sorted(provincias)
+
+        # For each provincia, compute metrics and collect providers
+        metrics_by_prov: dict[str, pd.Series] = {}
+        all_proveedores: set[str] = set()
+
+        for prov in provincias:
+            df_metrics = fb.build(
+                df=cleaned_df,
+                features=["first_visit"],
+                drop_incomplete=True,
+                provincia=prov,
+                location=location,
+            )
+
+            if df_metrics is None or df_metrics.empty:
+                continue
+
+            s = df_metrics["first_visit"].dropna()
+            if s.empty:
+                continue
+
+            metrics_by_prov[str(prov)] = s
+            all_proveedores.update(s.index.astype(str))
+
+        if not metrics_by_prov:
+            raise ValueError(
+                "No 'first_visit' metrics available for any provincia "
+                "with the given filters."
+            )
+
+        # Determine proveedores universe
+        if proveedores is not None:
+            proveedores_all = [p for p in proveedores if p in all_proveedores]
+        else:
+            proveedores_all = sorted(all_proveedores)
+
+        if not proveedores_all:
+            raise ValueError("No proveedores found with valid 'first_visit' data.")
+
+        provincias_final = list(metrics_by_prov.keys())
+
+        # ---------------- groupby = 'provincia_proveedor' ----------------
+        if groupby == "provincia_proveedor":
+            # Build matrix of values: rows = provincias, cols = proveedores
+            values_matrix: list[list[float | float]] = []
+            flat_vals: list[float] = []
+
+            for prov in provincias_final:
+                row_vals: list[float | float] = []
+                s = metrics_by_prov[prov]
+                for proveedor in proveedores_all:
+                    if proveedor in s.index:
+                        v = float(s.loc[proveedor])
+                        row_vals.append(v)
+                        flat_vals.append(v)
+                    else:
+                        row_vals.append(np.nan)
+                values_matrix.append(row_vals)
+
+            # Scale to pct
+            if flat_vals:
+                max_val = max(flat_vals)
+                scale_to_pct = max_val <= 1.0 + 1e-9
+            else:
+                scale_to_pct = False
+
+            def _scale(v: float | float) -> float:
+                if pd.isna(v):
+                    return np.nan
+                return float(v) * 100.0 if scale_to_pct else float(v)
+
+            plot_matrix: list[list[float]] = [
+                [_scale(v) for v in row] for row in values_matrix
+            ]
+
+            fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+            n_prov = len(provincias_final)
+            n_carriers = len(proveedores_all)
+            x_base = np.arange(n_prov)
+            bar_width = 0.8 / max(n_carriers, 1)
+
+            for j, proveedor in enumerate(proveedores_all):
+                x_pos = x_base - 0.4 + bar_width * (j + 0.5)
+                vals = [row[j] for row in plot_matrix]
+                ax.bar(x_pos, vals, width=bar_width, label=proveedor)
+
+                for x, val in zip(x_pos, vals):
+                    if pd.isna(val):
+                        continue
+                    ax.text(
+                        x,
+                        val,
+                        f"{val:.1f}%" if scale_to_pct else f"{val:.2f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=8,
+                    )
+
+            if title is None:
+                title = "First visit por provincia y proveedor"
+
+            ax.set_title(title, fontsize=14)
+            ax.set_ylabel(
+                "First visit success (%)" if scale_to_pct else "First visit",
+                fontsize=12,
+            )
+            ax.set_xticks(x_base)
+            ax.set_xticklabels(provincias_final, rotation=rotation, ha="right")
+
+            ax.legend(title="Proveedor", bbox_to_anchor=(1.05, 1), loc="upper left")
+            ax.grid(alpha=0.3, axis="y")
+            fig.tight_layout()
+            return fig
+
+        # -------------- groupby = 'proveedor_provincia' --------------
+        # Build matrix of values: rows = proveedores, cols = provincias
+        values_matrix_pp: list[list[float | float]] = []
+        flat_vals_pp: list[float] = []
+
+        for proveedor in proveedores_all:
+            row_vals: list[float | float] = []
+            for prov in provincias_final:
+                s = metrics_by_prov[prov]
+                if proveedor in s.index:
+                    v = float(s.loc[proveedor])
+                    row_vals.append(v)
+                    flat_vals_pp.append(v)
+                else:
+                    row_vals.append(np.nan)
+            values_matrix_pp.append(row_vals)
+
+        if flat_vals_pp:
+            max_val = max(flat_vals_pp)
+            scale_to_pct_pp = max_val <= 1.0 + 1e-9
+        else:
+            scale_to_pct_pp = False
+
+        def _scale_pp(v: float | float) -> float:
+            if pd.isna(v):
+                return np.nan
+            return float(v) * 100.0 if scale_to_pct_pp else float(v)
+
+        plot_matrix_pp: list[list[float]] = [
+            [_scale_pp(v) for v in row] for row in values_matrix_pp
+        ]
+
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+        n_prov = len(provincias_final)
+        n_carriers = len(proveedores_all)
+        x_base = np.arange(n_carriers)
+        bar_width = 0.8 / max(n_prov, 1)
+
+        for j, prov in enumerate(provincias_final):
+            x_pos = x_base - 0.4 + bar_width * (j + 0.5)
+            vals = [row[j] for row in plot_matrix_pp]
+            ax.bar(x_pos, vals, width=bar_width, label=prov)
+
+            for x, val in zip(x_pos, vals):
+                if pd.isna(val):
+                    continue
+                ax.text(
+                    x,
+                    val,
+                    f"{val:.1f}%" if scale_to_pct_pp else f"{val:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+        if title is None:
+            title = "First visit por proveedor y provincia"
+
+        ax.set_title(title, fontsize=14)
+        ax.set_ylabel(
+            "First visit success (%)" if scale_to_pct_pp else "First visit",
+            fontsize=12,
+        )
+        ax.set_xticks(x_base)
+        ax.set_xticklabels(proveedores_all, rotation=rotation, ha="right")
+
+        ax.legend(title="Provincia", bbox_to_anchor=(1.05, 1), loc="upper left")
+        ax.grid(alpha=0.3, axis="y")
+        fig.tight_layout()
+        return fig
+
+
