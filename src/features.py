@@ -48,10 +48,15 @@ class FeatureBuilder:
                 func=self._feature_coverage,
                 criteria_type="benefit",
             ),
-            "sla": FeatureConfig(              # <-- NEW FEATURE
+            "sla": FeatureConfig(              
                 func=self._feature_sla,
                 criteria_type="benefit",
             ),
+            "speed": FeatureConfig(
+                func=self._feature_speed,
+                criteria_type="cost",   # smaller delivery window = better
+),
+
         }
 
     @property
@@ -375,4 +380,70 @@ class FeatureBuilder:
                 out[prov_short] = rows["sla_ok"].mean() * 100.0
 
         return pd.Series(out)
+    
+    def _feature_speed(
+        self,
+        df: pd.DataFrame,
+        provincia: str | None = None,
+        location: str = "both",
+        codigo_postal: str | None = None,
+        rango_peso: str | None = None,
+        **_,
+    ) -> pd.Series:
+        """
+        'Speed' feature: average delivery window length (maximum_delivery - minimum_delivery)
+        for each proveedor, after applying the usual filters.
+
+        Smaller values = faster service (shorter promised window), in *days*.
+        """
+
+        df2 = df.copy()
+        df2 = df2[
+            [
+                "Correo",
+                "Provincia",
+                "Codigo Postal",
+                "Capital/Interior",
+                "Rango de Peso",
+                "minimum_delivery",
+                "maximum_delivery",
+            ]
+        ]
+
+        # Filters
+        if provincia:
+            df2 = df2[df2["Provincia"] == provincia]
+        if codigo_postal:
+            df2 = df2[df2["Codigo Postal"] == codigo_postal]
+        if rango_peso:
+            df2 = df2[df2["Rango de Peso"] == rango_peso]
+        if location == "capital":
+            df2 = df2[df2["Capital/Interior"] == "CIUDAD"]
+        elif location == "interior":
+            df2 = df2[df2["Capital/Interior"] == "INTERIOR"]
+
+        # Need valid dates to compute a difference
+        date_cols = ["minimum_delivery", "maximum_delivery"]
+        df2 = df2[df2[date_cols].notna().all(axis=1)]
+
+        # Length of the SLA window in *days*
+        # (if some dirty row has maximum < minimum, treat as NaN)
+        window_days = (df2["maximum_delivery"] - df2["minimum_delivery"]).dt.total_seconds() / (24 * 3600)
+        #window_days = (df2["maximum_delivery"] - df2["minimum_delivery"]).dt.days
+        window_days = window_days.mask(window_days < 0, np.nan)
+        df2["sla_window_days"] = window_days
+
+        out: dict[str, float] = {}
+        for prov_short in self.proveedores_short:
+            correo_key = self.correo_keys[prov_short]
+            rows = df2[df2["Correo"] == correo_key]
+
+            if len(rows) == 0:
+                out[prov_short] = np.nan
+            else:
+                out[prov_short] = rows["sla_window_days"].mean()
+
+        # name is optional but sometimes nice for debugging
+        return pd.Series(out, name="speed")
+
 
