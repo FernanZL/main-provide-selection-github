@@ -311,6 +311,12 @@ class FeatureBuilder:
                 return pd.Series({short: 0 for short in PROVEEDORES_SHORT})
             row = df2.iloc[0]
             return pd.Series({rename[c]: int(row[c]) for c in PROVEEDORES_FULL})
+        
+        if location == 'capital':
+            if len(df2) == 0:
+                return pd.Series({short: 0 for short in PROVEEDORES_SHORT})
+            row = df2.iloc[0]
+            return pd.Series({rename[c]: int(row[c]) for c in PROVEEDORES_FULL})
 
         total_cp = df2["Codigo Postal"].nunique()
         out = {}
