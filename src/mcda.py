@@ -10,6 +10,8 @@ from typing import Sequence, Optional, TYPE_CHECKING
 import pandas as pd
 import numpy as np
 from pymcdm.methods import WASPAS as PymWASPAS, VIKOR as PymVIKOR, TOPSIS as PymTOPSIS, WSM as PymWSM
+from src.weight_presets import get_weight_presets
+from sklearn.preprocessing import MinMaxScaler  # add at top of file
 
 if TYPE_CHECKING:
     from src.features import FeatureBuilder
@@ -20,117 +22,25 @@ class MCDAEngine:
         self,
         methods=("weighted", "topsis", "vikor", "waspas"),
         first_visit_threshold: float = 90.0,
+        weight_presets: dict[str, dict[str, float]] | None = None,
     ):
         self.methods = set(methods)
 
-        # Business rule: below this % first_visit / delivery is "bad".
-        # Used as neutral imputation for missing values in MCDA.
-        self.first_visit_threshold = float(first_visit_threshold)
+        # Business rule: threshold, etc.
+        self.first_visit_threshold = first_visit_threshold
 
-        # Presets focused on (first_visit, cost, coverage, delivery and sla)
-        self.weight_presets = {
+        # Load presets from config file unless caller overrides
+        if weight_presets is None:
+            self.weight_presets = get_weight_presets()
+        else:
+            # Make a defensive copy so external code doesn't mutate internal state
+            self.weight_presets = {
+                name: p.copy() for name, p in weight_presets.items()
+            }
 
-    # 1) Fully balanced across all 6 criteria
-    "balanced": {
-        "first_visit": 0.17,
-        "cost":        0.17,
-        "coverage":    0.16,
-        "delivery":    0.17,
-        "sla":         0.16,
-        "speed":       0.17,
-    },
-
-    # 2) Prioritize full service (1era visita + entrega + SLA + speed)
-    "service_quality": {
-        "first_visit": 0.25,
-        "cost":        0.13,
-        "coverage":    0.10,
-        "delivery":    0.22,
-        "sla":         0.17,
-        "speed":       0.13,
-    },
-
-    # 3) Cost is the main driver (speed is minor)
-    "cost_focus": {
-        "first_visit": 0.10,
-        "cost":        0.46,
-        "coverage":    0.09,
-        "delivery":    0.12,
-        "sla":         0.13,
-        "speed":       0.10,
-    },
-
-    # 4) Expand coverage nationally (speed small, coverage huge)
-    "coverage_focus": {
-        "first_visit": 0.10,
-        "cost":        0.10,
-        "coverage":    0.48,
-        "delivery":    0.11,
-        "sla":         0.11,
-        "speed":       0.10,
-    },
-
-    # 5) Reliability (delivery + SLA + speed) as top priority
-    "reliability_first": {
-        "first_visit": 0.12,
-        "cost":        0.08,
-        "coverage":    0.08,
-        "delivery":    0.30,
-        "sla":         0.30,
-        "speed":       0.12,
-    },
-
-    # 6) Strict service: 1era visita & entrega >>> cost, speed moderate
-    "service_strict": {
-        "first_visit": 0.32,
-        "cost":        0.04,
-        "coverage":    0.08,
-        "delivery":    0.28,
-        "sla":         0.18,
-        "speed":       0.10,
-    },
-
-    # 7) SLA-focused (predictability/time commitments), speed second
-    "sla_priority": {
-        "first_visit": 0.12,
-        "cost":        0.08,
-        "coverage":    0.08,
-        "delivery":    0.17,
-        "sla":         0.40,
-        "speed":       0.15,
-    },
-
-    # 8) Premium shipping (fast + reliable, cost less relevant)
-    "premium_shipping": {
-        "first_visit": 0.20,
-        "cost":        0.07,
-        "coverage":    0.06,
-        "delivery":    0.25,
-        "sla":         0.22,
-        "speed":       0.20,
-    },
-
-    # 9) Startup scaling mode: reach + price (speed low but nonzero)
-    "startup_scaling": {
-        "first_visit": 0.08,
-        "cost":        0.32,
-        "coverage":    0.32,
-        "delivery":    0.09,
-        "sla":         0.09,
-        "speed":       0.10,
-    },
-
-    # 10) Practical mix (good real-world baseline)
-    "practical": {
-        "first_visit": 0.21,
-        "cost":        0.31,
-        "coverage":    0.14,
-        "delivery":    0.15,
-        "sla":         0.09,
-        "speed":       0.10,
-    },
-}
-
+        # DEBUG: last feature matrices used internally
+        self.debug_last_imputed: pd.DataFrame | None = None
+        self.debug_last_scaled: pd.DataFrame | None = None
 
     @property
     def available_weight_presets(self) -> list[str]:
@@ -150,6 +60,7 @@ class MCDAEngine:
         feature_builder: Optional["FeatureBuilder"] = None,
         weights_preset: Optional[str] = None,
         smooth_approximation: bool = False,  # <--- NEW FLAG
+        normalize_globally: bool = False, 
     ):
         """
         Compute MCDA scores for the given DataFrame.
@@ -182,7 +93,7 @@ class MCDAEngine:
             FeatureBuilder instance used to infer criteria_types and read
             global μ for first_visit / delivery when doing business-rule imputation.
         weights_preset : str, optional (keyword-only)
-            Name of a predefined weight preset (focused on first_visit, cost, coverage).
+            Name of a predefined weight preset (focused on the 6 features).
             Mutually exclusive with `weights`.
         smooth_approximation : bool, optional (keyword-only)
             If True, use cached cubic smooth approximation for first_visit / delivery
@@ -194,10 +105,14 @@ class MCDAEngine:
 
         # ---- which criteria columns to use (and in what order) ----
         if features is not None:
-            cols = list(features)
-            missing = [c for c in cols if c not in df_all.columns]
-            if missing:
-                raise ValueError(f"Columns {missing} not found in df_metrics")
+            # <<< NEW: intersect requested features with columns that actually exist
+            requested = list(features)
+            cols = [c for c in requested if c in df_all.columns]
+            if not cols:
+                raise ValueError(
+                    f"None of the requested features {requested} are present "
+                    f"in df_metrics columns {list(df_all.columns)}."
+                )
             df = df_all[cols].copy()
         else:
             df = df_all.copy()
@@ -213,7 +128,7 @@ class MCDAEngine:
             raise ValueError("Provide either `weights` or `weights_preset`, not both.")
 
         if weights is not None:
-            # manual weights – must match number of criteria and sum to 1
+            # manual weights – must match number of *current* criteria (cols)
             weights_arr = np.array(weights, dtype=float)
             if len(weights_arr) != len(cols):
                 raise ValueError(
@@ -231,33 +146,43 @@ class MCDAEngine:
                 )
             preset_map = self.weight_presets[weights_preset]
             # Map preset weights by column name; missing columns → 0
+            # (columns that didn't survive earlier dropping simply don't appear in `cols`)
             base = np.array([preset_map.get(c, 0.0) for c in cols], dtype=float)
             if base.sum() <= 0:
                 raise ValueError(
                     f"Preset '{weights_preset}' produced all-zero weights "
                     f"for the selected criteria {cols}."
                 )
-            weights_arr = base / base.sum()
+            weights_arr = base / base.sum()   # <<< NEW: normalized for surviving cols
         else:
-            # default: equal weights
+            # default: equal weights over the surviving cols
             weights_arr = np.ones(len(cols), dtype=float)
-            weights_arr = weights_arr / weights_arr.sum()  # trivially 1
+            weights_arr = weights_arr / weights_arr.sum()
 
         # ---- criteria_types: explicit, inferred from FeatureBuilder, or heuristic ----
         if criteria_types is None:
             if feature_builder is not None and features is not None:
-                # infer from FeatureBuilder metadata
-                criteria_types = feature_builder.criteria_types_for(features)
+                # infer from FeatureBuilder metadata, but only for columns that survived
+                criteria_types = feature_builder.criteria_types_for(cols)  # <<< NEW: use `cols`
             else:
                 # fallback: infer from column names (old behavior)
-                criteria_types = tuple(
-                    "cost" if "cost" in c.lower() else "benefit" for c in cols
-                )
-        else:
-            criteria_types = tuple(criteria_types)
+                criteria_types = []
+                for c in cols:
+                    name = c.lower()
+                    if "cost" in name or name == "speed":
+                        criteria_types.append("cost")
+                    else:
+                        criteria_types.append("benefit")
+                criteria_types = tuple(criteria_types)
 
-        if len(criteria_types) != len(cols):
-            raise ValueError("criteria_types must match the selected criteria columns")
+        else:
+            # we trust the caller, but they must match surviving columns
+            if len(criteria_types) != len(cols):
+                raise ValueError(
+                    "criteria_types must match the selected criteria columns "
+                    f"(got {len(criteria_types)}, expected {len(cols)})."
+                )
+            criteria_types = tuple(criteria_types)
 
         # ---- numeric conversion ----
         for c in cols:
@@ -277,10 +202,12 @@ class MCDAEngine:
         weights_arr = weights_arr[mask]
         criteria_types = tuple(ct for ct, m in zip(criteria_types, mask) if m)
 
-        # renormalize after dropping all-NaN criteria (we keep proportions)
+        # renormalize after dropping NaN-only criteria (we keep proportions)
         if weights_arr.sum() <= 0:
             raise ValueError("After dropping NaN-only criteria, all weights became zero.")
         weights_arr = weights_arr / weights_arr.sum()
+
+        # (implicit but important: if only ONE column survived, weights_arr will be [1.0])
 
         # ---- NEW: get global μ_first_visit / μ_delivery from FeatureBuilder if available ----
         mu_global_first_visit = None
@@ -291,23 +218,113 @@ class MCDAEngine:
             if hasattr(feature_builder, "delivery_mu_global"):
                 mu_global_delivery = feature_builder.delivery_mu_global
 
-        # ---- NEW: apply business-rule imputation ONCE (for first_visit & delivery) ----
+                # ---- apply business-rule imputation ONCE (for first_visit & delivery) ----
         data_imputed = self._impute_with_business_rule(
             df,
             cols,
             mu_global_first_visit=mu_global_first_visit,
             mu_global_delivery=mu_global_delivery,
-            smooth_approximation=smooth_approximation,  # <--- PASS FLAG THROUGH
+            smooth_approximation=smooth_approximation,
         )
 
-        # ---- run each MCDA method (assume df already imputed) ----
+        # DEBUG: store imputed (pre-scaling) matrix
+        self.debug_last_imputed = data_imputed.copy()
+                # ---- OPTIONAL: global normalization using sklearn scaler ----
+        data_for_mcda = data_imputed
+
+        if normalize_globally:
+            if feature_builder is None:
+                raise ValueError(
+                    "normalize_globally=True but feature_builder is None. "
+                    "Pass the FeatureBuilder used to build the features."
+                )
+
+            if (
+                not hasattr(feature_builder, "global_feature_df")
+                or feature_builder.global_feature_df is None
+            ):
+                raise ValueError(
+                    "normalize_globally=True but feature_builder.global_feature_df is None. "
+                    "Call FeatureBuilder.build(..., cache_global=True) once on the full dataset."
+                )
+
+            global_df = feature_builder.global_feature_df
+
+            # All criteria actually used in this run:
+            global_cols_all = [c for c in cols if c in global_df.columns]
+
+            # We scale all of them globally
+            scale_cols = [c for c in global_cols_all]
+
+            # If nothing to scale, just use imputed data as-is
+            if not scale_cols:
+                data_for_mcda = data_imputed
+            else:
+                global_raw = global_df[scale_cols].copy()
+
+                # Apply the SAME business-rule transform so the scaler "sees" the same kind of data
+                global_imputed = self._impute_with_business_rule(
+                    global_raw,
+                    scale_cols,
+                    mu_global_first_visit=mu_global_first_visit,
+                    mu_global_delivery=mu_global_delivery,
+                    smooth_approximation=smooth_approximation,
+                )
+
+                scaler = MinMaxScaler()
+                scaler.fit(global_imputed[scale_cols])
+
+                data_scaled = data_imputed.copy()
+
+                # Transform and THEN CLIP to [0, 1]
+                scaled_arr = scaler.transform(data_imputed[scale_cols])
+                scaled_arr = np.clip(scaled_arr, 0.0, 1.0)
+                data_scaled[scale_cols] = scaled_arr
+
+                # 🔧 NEW: if in THIS FILTERED SLICE a column is all 1s,
+                # we skip normalization for that column and keep it as 1s.
+                for c in scale_cols:
+                    local_vals = data_imputed[c].to_numpy(dtype=float)
+                    # If everything (finite) is ~1.0 in this slice, restore it
+                    finite = np.isfinite(local_vals)
+                    if finite.any() and np.allclose(local_vals[finite], 1.0, atol=1e-9):
+                        # keep the original imputed 1s instead of the scaled values (which might be 0)
+                        data_scaled[c] = local_vals
+
+                data_for_mcda = data_scaled
+
+            # DEBUG: store scaled matrix
+            self.debug_last_scaled = data_for_mcda.copy()
+
+        else:
+            self.debug_last_scaled = data_imputed.copy()
+            data_for_mcda = data_imputed
+
+
+
+        # ---- run each MCDA method (assume df already imputed & (optionally) scaled) ----
+
+        # SAFETY: cost criteria cannot be zero for WASPAS (min/x normalization),
+        # so we bump zeros to a tiny epsilon. This is negligible numerically
+        # but avoids division by zero inside pymcdm.
+        eps = 1e-6
+        data_for_mcda = data_for_mcda.copy()
+        for col, ct in zip(cols, criteria_types):
+            if ct == "cost":
+                col_vals = data_for_mcda[col].to_numpy(dtype=float)
+                if np.any(col_vals <= 0):
+                    col_vals[col_vals <= 0] = eps
+                    data_for_mcda[col] = col_vals
+
         results = {}
         for m in methods:
             if m not in self.methods:
                 raise ValueError(f"Unknown method '{m}'")
             func = getattr(self, f"_{m}")
-            score = func(data_imputed, cols, weights_arr, criteria_types)
+            score = func(data_for_mcda, cols, weights_arr, criteria_types)
             results[f"Score_{m}"] = score
+
+
 
         # ---- build output ----
         df_out = pd.concat([df_metrics.copy()] + [v for v in results.values()], axis=1)
@@ -320,6 +337,7 @@ class MCDAEngine:
             df_out = df_out.sort_values(sort_col, ascending=False)
 
         return df_out if return_df else results[list(results.keys())[0]]
+
 
     def _impute_with_business_rule(
         self,
@@ -748,8 +766,55 @@ class MCDAEngine:
         type_map = {"benefit": 1, "cost": -1}
         types = np.array([type_map[ct] for ct in criteria_types], dtype=int)
 
+        # ---- 1) If only ONE alternative, score = 1.0 by convention ----
+        if X.shape[0] == 1:
+            return pd.Series(
+                np.ones(1, dtype=float),
+                index=df.index,
+                name="Score_waspas",
+            )
+
+        # ---- 2) Detect constant criteria (zero variance or all NaN) ----
+        const_idx = []
+        for j in range(X.shape[1]):
+            col_vals = X[:, j]
+            finite = ~np.isnan(col_vals)
+            if finite.sum() == 0:
+                # fully NaN → constant / useless
+                const_idx.append(j)
+            else:
+                vals = col_vals[finite]
+                if np.allclose(vals, vals[0]):
+                    # zero variance
+                    const_idx.append(j)
+
+        if const_idx:
+            mask = np.ones(X.shape[1], dtype=bool)
+            mask[const_idx] = False
+
+            # If *all* criteria are constant, everyone is equally good: score 1
+            if mask.sum() == 0:
+                return pd.Series(
+                    np.ones(X.shape[0], dtype=float),
+                    index=df.index,
+                    name="Score_waspas",
+                )
+
+            # Drop constant columns (they don't affect ranking)
+            X = X[:, mask]
+            w = w[mask]
+            types = types[mask]
+
+            # Re-normalize weights
+            if w.sum() != 0:
+                w = w / w.sum()
+            else:
+                w = np.ones_like(w, dtype=float) / len(w)
+
+        # ---- 3) Run WASPAS on the cleaned matrix ----
         method = PymWASPAS()
-        prefs = method(X, w, types, validation=True, verbose=False)
+        # validation=False for consistency with TOPSIS/WSM/VIKOR calls
+        prefs = method(X, w, types, validation=False, verbose=False)
 
         score = pd.Series(prefs, index=df.index, name="Score_waspas")
         return score
