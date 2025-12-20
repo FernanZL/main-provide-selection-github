@@ -21,6 +21,15 @@ MAIN_CSV_PATH = "datasets\\shipments_july_sla.csv"      # ruta al CSV principal
 EXTRA_CSV_PATH = None                                   # o algo como "data/envios_sla.csv"
 
 
+# ---------- Colab detection (local-safe) ----------
+def _is_colab() -> bool:
+    try:
+        import google.colab  # type: ignore
+        return True
+    except Exception:
+        return False
+
+
 def _load_current_presets(path: str = PRESETS_JSON_PATH) -> dict[str, dict[str, float]]:
     """
     Load current presets from JSON file, or {} if not found/invalid.
@@ -93,6 +102,7 @@ load_default_btn = w.Button(
     layout=w.Layout(width="430px")
 )
 
+# --- Local/Jupyter upload widgets (not reliable in Colab) ---
 upload_widget = w.FileUpload(
     accept=".csv",
     multiple=False,
@@ -107,6 +117,19 @@ load_uploaded_btn = w.Button(
     layout=w.Layout(width="430px"),
     disabled=True
 )
+
+# --- Colab upload (reliable) ---
+colab_upload_btn = w.Button(
+    description="Subir CSV (Colab)",
+    icon="upload",
+    button_style="success",
+    layout=w.Layout(width="430px"),
+)
+colab_upload_out = w.Output(layout=w.Layout(width="430px"))
+
+# hidden by default; enabled in _apply_data_source_mode_ui()
+colab_upload_btn.layout.display = "none"
+colab_upload_out.layout.display = "none"
 
 prov_dropdown = w.Dropdown(
     options=["(subí un archivo)"], value="(subí un archivo)",
@@ -1223,6 +1246,48 @@ def on_preset_change(change):
 preset_select.observe(on_preset_change, names='value')
 
 
+# ---------- Colab upload handler (local-safe) ----------
+
+def on_colab_upload_clicked(_):
+    info_box.clear_output()
+    colab_upload_out.clear_output()
+
+    if not _is_colab():
+        with info_box:
+            print("⚠️ Este botón es solo para Colab.")
+        return
+
+    try:
+        from google.colab import files  # type: ignore
+    except Exception as e:
+        with info_box:
+            print(f"❌ No pude importar google.colab.files: {e}")
+        return
+
+    with colab_upload_out:
+        print("📥 Elegí un CSV para subir...")
+
+    uploaded = files.upload()  # browser picker
+    if not uploaded:
+        with colab_upload_out:
+            print("ℹ️ No se subió ningún archivo.")
+        return
+
+    filename, content = next(iter(uploaded.items()))
+    if not content:
+        with colab_upload_out:
+            print("❌ El archivo subido está vacío.")
+        return
+
+    with colab_upload_out:
+        print(f"✅ Subido: {filename} (bytes={len(content)})")
+        print("🔄 Cargando dataset...")
+
+    load_data_from_uploaded_bytes(content, filename=filename)
+
+colab_upload_btn.on_click(on_colab_upload_clicked)
+
+
 # ========= RANKING HANDLER =========
 
 def on_run_clicked(_):
@@ -1995,14 +2060,34 @@ original_update_btn.on_click(on_original_update_clicked)
 # ---------- Dataset source mode UI ----------
 
 def _apply_data_source_mode_ui():
+    colab = _is_colab()
+
     if data_source_mode.value == "default":
+        # hide all upload UIs
         upload_widget.layout.display = "none"
         load_uploaded_btn.layout.display = "none"
+        colab_upload_btn.layout.display = "none"
+        colab_upload_out.layout.display = "none"
+
+        # show default loader
         load_default_btn.layout.display = ""
     else:
-        upload_widget.layout.display = ""
-        load_uploaded_btn.layout.display = ""
+        # hide default loader
         load_default_btn.layout.display = "none"
+
+        if colab:
+            # Colab: use the reliable uploader
+            upload_widget.layout.display = "none"
+            load_uploaded_btn.layout.display = "none"
+
+            colab_upload_btn.layout.display = ""
+            colab_upload_out.layout.display = ""
+        else:
+            # Local/Jupyter: use ipywidgets upload
+            upload_widget.layout.display = ""
+            load_uploaded_btn.layout.display = ""
+            colab_upload_btn.layout.display = "none"
+            colab_upload_out.layout.display = "none"
 
 
 def on_data_source_mode_change(change):
@@ -2043,7 +2128,6 @@ def on_load_uploaded_clicked(_):
 
     load_data_from_uploaded_bytes(content, filename=name)
 
-
 load_uploaded_btn.on_click(on_load_uploaded_clicked)
 
 
@@ -2067,8 +2151,12 @@ dataset_box = w.VBox(
         data_source_mode,
         data_source_status,
         load_default_btn,
+        # Local uploader
         upload_widget,
         load_uploaded_btn,
+        # Colab uploader
+        colab_upload_btn,
+        colab_upload_out,
     ],
     layout=w.Layout(width="430px")
 )
