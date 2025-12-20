@@ -1338,8 +1338,9 @@ class ScenarioReporter:
         weight_by_range: Optional[bool] = None,
     ) -> Dict[str, list[str]]:
         """
-        Genera un CSV por provincia con filas CP x Rango de Peso y columnas:
+        Genera CSVs con filas CP x Rango de Peso y columnas:
 
+        - Provincia
         - Codigo Postal
         - Rango de Peso
         - proveedor_real         (más usado en la celda)
@@ -1347,29 +1348,41 @@ class ScenarioReporter:
         - Para cada feature f en `features`:
             f"_real"   -> valor de f para proveedor_real
             f"_mcda"   -> valor de f para proveedor_mcda
-            f"_delta"  -> f_mcda - f_real
+            f"_delta"  -> convención consistente:
+                COST:    delta = real - mcda   (positivo => mejora/ahorro)
+                BENEFIT: delta = mcda - real   (positivo => mejora)
 
-        Parámetros:
-            - provincias:
-                None  -> todas las provincias en self.df
-                str   -> solo esa provincia
-                lista -> esas provincias
-            - features:
-                None  -> usa feature_builder.available_features
+        Comportamiento de `provincias`:
+        - None / "Todas" / "all" / "*": exporta UN SOLO CSV global (todas las provincias),
+        agregando la columna "Provincia".
+        - str (p.ej. "Corrientes"): exporta un CSV para esa provincia.
+        - Sequence[str]: exporta un CSV por provincia en la lista (comportamiento histórico).
 
         Devuelve:
-            { provincia: [ruta_csv_creada] }  (lista con un solo elemento)
+            { clave: [ruta_csv_creada, ...] }
+            - Para global: {"Todas": [ruta]}
+            - Para una provincia: {provincia: [ruta]}
+            - Para lista: {prov: [ruta], ...}
         """
         if "Provincia" not in self.df.columns:
             raise ValueError("La columna 'Provincia' no está en el DataFrame.")
 
         # --- provincias a procesar ---
-        if provincias is None:
+        def _is_all_token(x: Optional[Union[str, Sequence[str]]]) -> bool:
+            if x is None:
+                return True
+            if isinstance(x, str):
+                return str(x).strip().lower() in ("todas", "all", "*")
+            return False
+
+        export_global = _is_all_token(provincias)
+
+        if export_global:
             provs = sorted(self.df["Provincia"].dropna().unique())
         elif isinstance(provincias, str):
             provs = [provincias]
         else:
-            provs = list(provincias)
+            provs = list(provincias) if provincias is not None else sorted(self.df["Provincia"].dropna().unique())
 
         # --- features a procesar ---
         if features is None:
@@ -1383,8 +1396,174 @@ class ScenarioReporter:
         # carpeta de salida
         os.makedirs(out_dir, exist_ok=True)
 
-        result: Dict[str, list[str]] = {p: [] for p in provs}
+        # Resultado
+        if export_global:
+            result: Dict[str, list[str]] = {"Todas": []}
+        else:
+            result = {p: [] for p in provs}
 
+        # ------------------------------------------------------------------
+        # MODO GLOBAL: UN SOLO CSV (todas las provincias juntas)
+        # ------------------------------------------------------------------
+        if export_global:
+            df_base = self.df.copy()
+            if df_base.empty:
+                return result
+
+            if "Codigo Postal" not in df_base.columns or "Rango de Peso" not in df_base.columns:
+                return result
+
+            # Para evitar combinaciones inválidas, iteramos por provincia y luego por CP/RP
+            rows: list[dict] = []
+
+            for prov in provs:
+                df_prov = df_base[df_base["Provincia"] == prov].copy()
+                if df_prov.empty:
+                    continue
+
+                cps = sorted(df_prov["Codigo Postal"].dropna().unique())
+                rangos = sorted(df_prov["Rango de Peso"].dropna().unique())
+
+                for cp in cps:
+                    for rp in rangos:
+                        df_cell = df_prov[
+                            (df_prov["Codigo Postal"] == cp)
+                            & (df_prov["Rango de Peso"] == rp)
+                        ]
+
+                        n_rows = len(df_cell)
+                        if n_rows < min_shipments:
+                            continue
+
+                        # --- proveedor "real" (más usado) ---
+                        baseline_full = self._most_used_provider_full(df_cell)
+                        if baseline_full is None:
+                            continue
+                        baseline_short = self.full_to_short.get(baseline_full, baseline_full)
+
+                        # --- construir métricas para esta celda ---
+                        build_kwargs: Dict[str, Any] = dict(
+                            provincia=prov,
+                            location="both",
+                            codigo_postal=cp,
+                            rango_peso=rp,
+                        )
+                        if by_shipments is not None:
+                            build_kwargs["by_shipments"] = by_shipments
+                        if weight_by_range is not None:
+                            build_kwargs["weight_by_range"] = weight_by_range
+
+                        df_metrics = self.feature_builder.build(df_cell, **build_kwargs)
+                        if df_metrics is None or df_metrics.empty:
+                            continue
+
+                        # índice del proveedor real
+                        if baseline_short in df_metrics.index:
+                            baseline_idx = baseline_short
+                        elif baseline_full in df_metrics.index:
+                            baseline_idx = baseline_full
+                        else:
+                            continue
+
+                        # --- MCDA ranking para esta celda ---
+                        all_feats_for_mcda = list(df_metrics.columns)
+
+                        score_kwargs: Dict[str, Any] = dict(
+                            return_df=True,
+                            sort=True,
+                            avg=False,
+                            feature_builder=self.feature_builder,
+                            features=all_feats_for_mcda,
+                        )
+                        if methods is not None:
+                            score_kwargs["methods"] = methods
+                        if weights is not None:
+                            score_kwargs["weights"] = weights
+                        if criteria_types is not None:
+                            score_kwargs["criteria_types"] = criteria_types
+                        if weights_preset is not None:
+                            score_kwargs["weights_preset"] = weights_preset
+                        if smooth_approximation is not None:
+                            score_kwargs["smooth_approximation"] = smooth_approximation
+                        if normalize_globally is not None:
+                            score_kwargs["normalize_globally"] = normalize_globally
+
+                        try:
+                            scores_df = self.mcda_engine.score(df_metrics, **score_kwargs)
+                        except Exception:
+                            continue
+
+                        if scores_df is None or scores_df.empty:
+                            continue
+
+                        mcda_short = str(scores_df.index[0])
+                        if mcda_short not in df_metrics.index:
+                            continue
+
+                        # --- construir la fila de salida ---
+                        row: Dict[str, Any] = {
+                            "Provincia": prov,
+                            "Codigo Postal": cp,
+                            "Rango de Peso": rp,
+                            "proveedor_real": baseline_short,
+                            "proveedor_mcda": mcda_short,
+                        }
+
+                        for ft in feats:
+                            real_col = f"{ft}_real"
+                            mcda_col = f"{ft}_mcda"
+                            delta_col = f"{ft}_delta"
+
+                            if ft in df_metrics.columns:
+                                try:
+                                    real_val = float(df_metrics.loc[baseline_idx, ft])
+                                    mcda_val = float(df_metrics.loc[mcda_short, ft])
+                                except Exception:
+                                    real_val = np.nan
+                                    mcda_val = np.nan
+
+                                if np.isfinite(real_val) and np.isfinite(mcda_val):
+                                    if self._feature_is_cost(ft):
+                                        delta_val = real_val - mcda_val
+                                    else:
+                                        delta_val = mcda_val - real_val
+                                else:
+                                    delta_val = np.nan
+                            else:
+                                real_val = np.nan
+                                mcda_val = np.nan
+                                delta_val = np.nan
+
+                            row[real_col] = real_val
+                            row[mcda_col] = mcda_val
+                            row[delta_col] = delta_val
+
+                        rows.append(row)
+
+            if not rows:
+                return result
+
+            df_out = pd.DataFrame(rows)
+
+            # orden de columnas
+            base_cols = ["Provincia", "Codigo Postal", "Rango de Peso", "proveedor_real", "proveedor_mcda"]
+            real_cols = [f"{ft}_real" for ft in feats]
+            mcda_cols = [f"{ft}_mcda" for ft in feats]
+            delta_cols = [f"{ft}_delta" for ft in feats]
+
+            col_order = [c for c in (base_cols + real_cols + mcda_cols + delta_cols) if c in df_out.columns]
+            df_out = df_out[col_order]
+
+            filename = "report_matrices_todas.csv"
+            filepath = os.path.join(out_dir, filename)
+            df_out.to_csv(filepath, index=False, encoding="utf-8")
+
+            result["Todas"].append(filepath)
+            return result
+
+        # ------------------------------------------------------------------
+        # MODO HISTÓRICO: UN CSV POR PROVINCIA (para str o lista)
+        # ------------------------------------------------------------------
         for prov in provs:
             df_prov = self.df[self.df["Provincia"] == prov].copy()
             if df_prov.empty:
@@ -1409,13 +1588,11 @@ class ScenarioReporter:
                     if n_rows < min_shipments:
                         continue
 
-                    # --- proveedor "real" (más usado) ---
                     baseline_full = self._most_used_provider_full(df_cell)
                     if baseline_full is None:
                         continue
                     baseline_short = self.full_to_short.get(baseline_full, baseline_full)
 
-                    # --- construir métricas para esta celda ---
                     build_kwargs: Dict[str, Any] = dict(
                         provincia=prov,
                         location="both",
@@ -1431,16 +1608,13 @@ class ScenarioReporter:
                     if df_metrics is None or df_metrics.empty:
                         continue
 
-                    # aseguramos que el índice exista
                     if baseline_short in df_metrics.index:
                         baseline_idx = baseline_short
                     elif baseline_full in df_metrics.index:
                         baseline_idx = baseline_full
                     else:
-                        # no se puede mapear el proveedor real a df_metrics
                         continue
 
-                    # --- MCDA ranking para esta celda ---
                     all_feats_for_mcda = list(df_metrics.columns)
 
                     score_kwargs: Dict[str, Any] = dict(
@@ -1475,7 +1649,6 @@ class ScenarioReporter:
                     if mcda_short not in df_metrics.index:
                         continue
 
-                    # --- construir la fila de salida ---
                     row: Dict[str, Any] = {
                         "Codigo Postal": cp,
                         "Rango de Peso": rp,
@@ -1492,9 +1665,6 @@ class ScenarioReporter:
                             real_val = float(df_metrics.loc[baseline_idx, ft])
                             mcda_val = float(df_metrics.loc[mcda_short, ft])
 
-                            # Delta convention for consistent colors:
-                            # - COST:    delta = real - mcda   (positivo => mejora/ahorro)
-                            # - BENEFIT: delta = mcda - real   (positivo => mejora)
                             if self._feature_is_cost(ft):
                                 delta_val = real_val - mcda_val
                             else:
@@ -1503,7 +1673,6 @@ class ScenarioReporter:
                             real_val = np.nan
                             mcda_val = np.nan
                             delta_val = np.nan
-
 
                         row[real_col] = real_val
                         row[mcda_col] = mcda_val
@@ -1516,18 +1685,12 @@ class ScenarioReporter:
 
             df_out = pd.DataFrame(rows)
 
-            # orden de columnas: CP / Rango / proveedores / bloque real / bloque mcda / bloque delta
             base_cols = ["Codigo Postal", "Rango de Peso", "proveedor_real", "proveedor_mcda"]
-
             real_cols = [f"{ft}_real" for ft in feats]
             mcda_cols = [f"{ft}_mcda" for ft in feats]
             delta_cols = [f"{ft}_delta" for ft in feats]
 
-            # aseguramos que solo usemos columnas que existen (por seguridad)
-            col_order = [
-                c for c in (base_cols + real_cols + mcda_cols + delta_cols)
-                if c in df_out.columns
-            ]
+            col_order = [c for c in (base_cols + real_cols + mcda_cols + delta_cols) if c in df_out.columns]
             df_out = df_out[col_order]
 
             prov_slug = self._sanitize_name(prov)
@@ -1539,4 +1702,5 @@ class ScenarioReporter:
             result[prov].append(filepath)
 
         return result
+
 
