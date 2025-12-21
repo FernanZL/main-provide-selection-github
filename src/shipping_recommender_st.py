@@ -1626,7 +1626,7 @@ def main():
         with col_rb1:
             report_combined_clicked = st.button("🧩 Reporte combinado: métricas + costos")
         with col_rb2:
-            report_mcda_clicked = st.button("🏁 Escenario: más usado vs #1 MCDA")
+            report_mcda_clicked = st.button("🏁 Comparación: histórico vs #1 ranking")
         with col_rb3:
             report_two_clicked = st.button("🆚 Escenario: proveedor A vs B")
 
@@ -1687,7 +1687,7 @@ def main():
                         )
                         text = scenario_reporter.pretty_cost_report(
                             stats,
-                            title_prefix="Escenario: proveedor más usado vs mejor proveedor según MCDA",
+                            title_prefix="Escenario: proveedor más usado vs mejor proveedor según simulación",
                         )
                         st.session_state["scenario_report_text"] = text
                     except Exception as e:
@@ -1903,7 +1903,7 @@ def main():
                     sty = df_real.style.format(lambda v: "" if pd.isna(v) else f"{float(v):.3f}")
                     st.dataframe(sty, use_container_width=True)
                 elif sheet_key == "mcda":
-                    st.markdown("**Valores MCDA (mejor proveedor según MCDA)**")
+                    st.markdown("**Valores simulados (mejor proveedor según métricas)**")
                     sty = df_mcda.style.format(lambda v: "" if pd.isna(v) else f"{float(v):.3f}")
                     st.dataframe(sty, use_container_width=True)
                 else:

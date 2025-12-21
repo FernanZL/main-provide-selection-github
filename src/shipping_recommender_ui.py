@@ -79,7 +79,7 @@ candidate_presets: dict[str, dict[str, float]] = {}
 
 
 # ---------- Widgets ----------
-title = w.HTML("<h2>📦 MCDA Shipping Recommender</h2>")
+title = w.HTML("<h2>📦 Recomendador de Envíos</h2>")
 
 info_box = w.Output()
 
@@ -365,7 +365,7 @@ report_combined_btn = w.Button(
 )
 
 report_mcda_btn = w.Button(
-    description="Escenario: más usado vs #1 MCDA",
+    description="Comparar: más elegido vs #1 en simulación",
     icon="search",
     layout=w.Layout(width="260px")
 )
@@ -1857,11 +1857,11 @@ def on_report_mcda_clicked(_):
 
         text = scenario_reporter.pretty_cost_report(
             stats,
-            title_prefix="Escenario: proveedor más usado vs mejor proveedor según MCDA",
+            title_prefix="Escenario: proveedor histórico vs mejor rankeado",
         )
     except Exception as e:
         with report_output:
-            print(f"❌ Error generando el escenario MCDA: {e}")
+            print(f"❌ Error generando el escenario: {e}")
         return
 
     html = _report_text_to_html(text)

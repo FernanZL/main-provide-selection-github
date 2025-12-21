@@ -1093,7 +1093,7 @@ class ScenarioReporter:
 
         lines: list[str] = []
 
-        lines.append("=== REPORTE DE MÉTRICAS (FeatureBuilder) ===")
+        lines.append("=== REPORTE DE MÉTRICAS ===")
         lines.append("")
         lines.append(metrics_text.strip())
         lines.append("")
