@@ -1276,7 +1276,7 @@ def on_colab_upload_clicked(_):
     with colab_upload_out:
         print("📥 Elegí un CSV para subir...")
 
-    uploaded = files.upload()  # browser picker
+    uploaded = files.upload()  # browser picker (also saves to runtime working dir)
     if not uploaded:
         with colab_upload_out:
             print("ℹ️ No se subió ningún archivo.")
@@ -1296,18 +1296,25 @@ def on_colab_upload_clicked(_):
     with open(save_path, "wb") as f:
         f.write(content)
 
+    # ✅ Remove the extra copy created by files.upload() in the runtime folder (usually /content/)
+    try:
+        runtime_path = os.path.join("/content", filename)
+        if os.path.exists(runtime_path):
+            os.remove(runtime_path)
+    except Exception:
+        # If deletion fails, it's not critical; just avoid crashing the UI.
+        pass
+
     with colab_upload_out:
         print(f"✅ Subido: {filename} (bytes={len(content)})")
-        print(f"📁 Guardado en: {save_path}")
+        # print(f"📁 Guardado en: {save_path}")
+        # print("🧹 Copia extra en runtime eliminada (si existía).")
         print("🔄 Cargando dataset...")
 
-    # Option A (minimal + consistent): still load using your current bytes loader
     load_data_from_uploaded_bytes(content, filename=filename)
 
-    # Option B (better, if you have it): load from disk instead
-    # load_data_from_uploaded_path(save_path)
-
 colab_upload_btn.on_click(on_colab_upload_clicked)
+
 
 
 
