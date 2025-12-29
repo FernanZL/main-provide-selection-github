@@ -1315,6 +1315,7 @@ def on_colab_upload_clicked(_):
     finally:
         os.chdir(prev_cwd)
 
+colab_upload_btn.on_click(on_colab_upload_clicked)
 
 
 
