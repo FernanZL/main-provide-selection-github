@@ -1267,7 +1267,7 @@ def on_colab_upload_clicked(_):
         return
 
     try:
-        from google.colab import files  # type: ignore
+        from google.colab import files
     except Exception as e:
         with info_box:
             print(f"❌ No pude importar google.colab.files: {e}")
@@ -1288,32 +1288,37 @@ def on_colab_upload_clicked(_):
             print("❌ El archivo subido está vacío.")
         return
 
-    # ✅ Ensure datasets folder exists (relative to your PROJECT_DIR / cwd)
+    # --- Save to datasets ---
     datasets_dir = os.path.join(os.getcwd(), "datasets")
     os.makedirs(datasets_dir, exist_ok=True)
 
-    # ✅ Save the uploaded file into datasets
     save_path = os.path.join(datasets_dir, filename)
     with open(save_path, "wb") as f:
         f.write(content)
 
-    # ✅ Remove the runtime temp copy created by Colab (in /content)
+    # --- Remove temp file created by Colab ---
     runtime_copy = os.path.join("/content", filename)
     if os.path.exists(runtime_copy):
         os.remove(runtime_copy)
 
     with colab_upload_out:
-        print(f"✅ Subido: {filename} (bytes={len(content)})")
+        print(f"✅ Subido: {filename}")
         print(f"📁 Guardado en: {save_path}")
         print("🔄 Cargando dataset...")
 
-    # ✅ Key fix: run loader while cwd=datasets to avoid extra copy in colab/
+    # --- Load (this creates the unwanted duplicate) ---
     prev_cwd = os.getcwd()
     try:
         os.chdir(datasets_dir)
         load_data_from_uploaded_bytes(content, filename=filename)
     finally:
         os.chdir(prev_cwd)
+
+    # ✅ THIS IS THE IMPORTANT FIX
+    # Delete the duplicate created in colab root
+    duplicate_in_colab = os.path.join(os.getcwd(), filename)
+    if os.path.exists(duplicate_in_colab):
+        os.remove(duplicate_in_colab)
 
 colab_upload_btn.on_click(on_colab_upload_clicked)
 
