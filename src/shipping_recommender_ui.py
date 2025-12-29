@@ -1276,7 +1276,7 @@ def on_colab_upload_clicked(_):
     with colab_upload_out:
         print("📥 Elegí un CSV para subir...")
 
-    uploaded = files.upload()  # browser picker (also saves to runtime working dir)
+    uploaded = files.upload()
     if not uploaded:
         with colab_upload_out:
             print("ℹ️ No se subió ningún archivo.")
@@ -1288,32 +1288,33 @@ def on_colab_upload_clicked(_):
             print("❌ El archivo subido está vacío.")
         return
 
-    # ✅ Save into ./datasets (relative to PROJECT_DIR because you already did os.chdir(PROJECT_DIR))
+    # ✅ Ensure datasets folder exists (relative to your PROJECT_DIR / cwd)
     datasets_dir = os.path.join(os.getcwd(), "datasets")
     os.makedirs(datasets_dir, exist_ok=True)
 
+    # ✅ Save the uploaded file into datasets
     save_path = os.path.join(datasets_dir, filename)
     with open(save_path, "wb") as f:
         f.write(content)
 
-    # ✅ Remove the extra copy created by files.upload() in the runtime folder (usually /content/)
-    try:
-        runtime_path = os.path.join("/content", filename)
-        if os.path.exists(runtime_path):
-            os.remove(runtime_path)
-    except Exception:
-        # If deletion fails, it's not critical; just avoid crashing the UI.
-        pass
+    # ✅ Remove the runtime temp copy created by Colab (in /content)
+    runtime_copy = os.path.join("/content", filename)
+    if os.path.exists(runtime_copy):
+        os.remove(runtime_copy)
 
     with colab_upload_out:
         print(f"✅ Subido: {filename} (bytes={len(content)})")
-        # print(f"📁 Guardado en: {save_path}")
-        # print("🧹 Copia extra en runtime eliminada (si existía).")
+        print(f"📁 Guardado en: {save_path}")
         print("🔄 Cargando dataset...")
 
-    load_data_from_uploaded_bytes(content, filename=filename)
+    # ✅ Key fix: run loader while cwd=datasets to avoid extra copy in colab/
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(datasets_dir)
+        load_data_from_uploaded_bytes(content, filename=filename)
+    finally:
+        os.chdir(prev_cwd)
 
-colab_upload_btn.on_click(on_colab_upload_clicked)
 
 
 
