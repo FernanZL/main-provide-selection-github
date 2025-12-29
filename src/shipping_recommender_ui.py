@@ -20,6 +20,15 @@ PRESETS_JSON_PATH = "current_weight_presets.json"  # stored in current working d
 MAIN_CSV_PATH = "datasets\\shipments_july_sla.csv"      # ruta al CSV principal
 EXTRA_CSV_PATH = None                                   # o algo como "data/envios_sla.csv"
 
+_BASE_DIR = None  # set from notebook
+
+def set_base_dir(path: str):
+    global _BASE_DIR
+    _BASE_DIR = os.path.abspath(path)
+
+def get_datasets_dir() -> str:
+    base = _BASE_DIR or os.getcwd()
+    return os.path.join(base, "datasets")
 
 # ---------- Colab detection (local-safe) ----------
 def _is_colab() -> bool:
@@ -1279,13 +1288,27 @@ def on_colab_upload_clicked(_):
             print("❌ El archivo subido está vacío.")
         return
 
+    # ✅ Save into ./datasets (relative to PROJECT_DIR because you already did os.chdir(PROJECT_DIR))
+    datasets_dir = os.path.join(os.getcwd(), "datasets")
+    os.makedirs(datasets_dir, exist_ok=True)
+
+    save_path = os.path.join(datasets_dir, filename)
+    with open(save_path, "wb") as f:
+        f.write(content)
+
     with colab_upload_out:
         print(f"✅ Subido: {filename} (bytes={len(content)})")
+        print(f"📁 Guardado en: {save_path}")
         print("🔄 Cargando dataset...")
 
+    # Option A (minimal + consistent): still load using your current bytes loader
     load_data_from_uploaded_bytes(content, filename=filename)
 
+    # Option B (better, if you have it): load from disk instead
+    # load_data_from_uploaded_path(save_path)
+
 colab_upload_btn.on_click(on_colab_upload_clicked)
+
 
 
 # ========= RANKING HANDLER =========
