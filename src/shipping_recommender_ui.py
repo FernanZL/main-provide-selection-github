@@ -20,11 +20,11 @@ PRESETS_JSON_PATH = "current_weight_presets.json"  # stored in current working d
 MAIN_CSV_PATH = "datasets\\shipments_july_sla.csv"      # ruta al CSV principal
 EXTRA_CSV_PATH = None                                   # o algo como "data/envios_sla.csv"
 
-_BASE_DIR = None  # set from notebook
+_BASE_DIR = os.getcwd()
 
-def set_base_dir(path: str):
+def set_base_dir(path=None):
     global _BASE_DIR
-    _BASE_DIR = os.path.abspath(path)
+    _BASE_DIR = os.path.abspath(path) if path else os.getcwd()
 
 def get_datasets_dir() -> str:
     base = _BASE_DIR or os.getcwd()

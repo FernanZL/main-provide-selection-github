@@ -67,64 +67,52 @@ class Preprocessor:
         - Drop rows where ALL extra date columns are NaT
         - Drop the extra key column (key_extra)
 
-        2) Experimental: single CSV already containing extra columns
-        (extra_csv_path is None, and df already has:
-            key_extra, last_status_date, minimum_delivery, maximum_delivery)
-        - Skip merge, start directly from the "clean + convert dates" steps
+        2) Already-merged: df already contains some/all of:
+            last_status_date, minimum_delivery, maximum_delivery
+        (key_extra may or may not be present)
+        - Apply the same cleaning as `clean`
+        - For each of those columns that exists: ensure datetime (convert if needed)
+        - Drop rows where ALL present extra date columns are NaT
+        - Drop key_extra if present (to match old behavior)
 
-        If those columns are NOT present, falls back to basic `clean(df)`.
+        If none of the extra date columns are present, falls back to basic `clean(df)`.
         """
 
-        # --- EXPERIMENTAL: already-merged mode (no extra_csv_path) ---
-        if extra_csv_path is None:
-            required_cols = [key_extra, "last_status_date", "minimum_delivery", "maximum_delivery"]
-            has_all_required = all(col in df.columns for col in required_cols)
+        # The date columns we care about when "already merged"
+        merged_date_cols = ["last_status_date", "minimum_delivery", "maximum_delivery"]
 
-            if not has_all_required:
-                # No extra CSV and no merged date columns → just do basic cleaning
+        # --- ALREADY-MERGED MODE (no extra_csv_path) ---
+        if extra_csv_path is None:
+            present_date_cols = [c for c in merged_date_cols if c in df.columns]
+
+            if not present_date_cols:
+                # No extra date columns at all → just do basic cleaning
                 print(
-                    "No extra CSV provided and required date columns not found. "
+                    "No extra CSV provided and merged date columns not found. "
                     "Falling back to basic `clean()`."
                 )
                 return self.clean(df)
 
             print(
-                "No extra CSV provided. Detected merged date columns in main df; "
-                "skipping merge and starting from cleaning + date conversion."
+                "No extra CSV provided. Detected merged date columns in df; "
+                "running cleaning + enforcing datetime conversion."
             )
 
-            # Treat df as `merged_df` from the old pipeline
-            cleaned_df = df.copy()
-            cleaned_df = cleaned_df.dropna()
-            cleaned_df = cleaned_df[
-                cleaned_df["Estado 1era Visita"].isin(["delivered", "not_delivered"])
-            ].reset_index(drop=True)
-            cleaned_df = cleaned_df[
-                cleaned_df["Estado"].isin(["delivered", "not_delivered"])
-            ].reset_index(drop=True)
+            # 1) Apply same cleaning rules as `clean`
+            cleaned_df = self.clean(df)
 
-            if self.normalize_names and "Provincia" in cleaned_df.columns:
-                cleaned_df["Provincia"] = self.normalize_provincias(cleaned_df["Provincia"])
+            # 2) Ensure datetime for each present date col (convert only if needed)
+            for col in present_date_cols:
+                if not pd.api.types.is_datetime64_any_dtype(cleaned_df[col]):
+                    cleaned_df[col] = pd.to_datetime(
+                        cleaned_df[col].astype(str).str.strip(),
+                        errors="coerce",
+                        format="mixed",
+                    )
 
-            # Only these three are the "extra" dates we care about in this mode
-            extra_date_cols = [
-                c
-                for c in ["last_status_date", "minimum_delivery", "maximum_delivery"]
-                if c in cleaned_df.columns
-            ]
-
-            # Convert extra date columns to datetime
-            for col in extra_date_cols:
-                cleaned_df[col] = pd.to_datetime(
-                    cleaned_df[col].astype(str).str.strip(),
-                    errors="coerce",
-                    format="mixed",
-                )
-
-            # Verify datetime dtypes
+            # 3) Verify datetime dtypes after conversion
             bad_cols = [
-                c
-                for c in extra_date_cols
+                c for c in present_date_cols
                 if not pd.api.types.is_datetime64_any_dtype(cleaned_df[c])
             ]
             if bad_cols:
@@ -132,18 +120,17 @@ class Preprocessor:
                     f"The following columns could not be converted to datetime: {bad_cols}"
                 )
 
-            # Drop rows where ALL extra date conversions failed (all NaT)
-            if extra_date_cols:
-                all_nat = cleaned_df[extra_date_cols].isna().all(axis=1)
-                cleaned_df = cleaned_df[~all_nat].reset_index(drop=True)
+            # 4) Drop rows where ALL present date cols are NaT
+            all_nat = cleaned_df[present_date_cols].isna().all(axis=1)
+            cleaned_df = cleaned_df[~all_nat].reset_index(drop=True)
 
-            # Drop extra key col ("id") to match old behavior
+            # 5) Drop key_extra if present (optional in this mode)
             if key_extra in cleaned_df.columns:
                 cleaned_df = cleaned_df.drop(columns=[key_extra])
 
             return cleaned_df
 
-        # --- CLASSIC: main CSV + extra CSV ---
+        # --- CLASSIC MODE: main CSV + extra CSV ---
         print(f"Loading extra date data from: {extra_csv_path}")
         extra_df = pd.read_csv(extra_csv_path)
 
@@ -170,26 +157,17 @@ class Preprocessor:
         )
 
         # 3) Apply the same cleaning rules as `clean`, but on the merged df
-        cleaned_df = merged_df.copy()
-        cleaned_df = cleaned_df.dropna()
-        cleaned_df = cleaned_df[
-            cleaned_df["Estado 1era Visita"].isin(["delivered", "not_delivered"])
-        ].reset_index(drop=True)
-        cleaned_df = cleaned_df[
-            cleaned_df["Estado"].isin(["delivered", "not_delivered"])
-        ].reset_index(drop=True)
-
-        if self.normalize_names and "Provincia" in cleaned_df.columns:
-            cleaned_df["Provincia"] = self.normalize_provincias(cleaned_df["Provincia"])
+        cleaned_df = self.clean(merged_df)
 
         # 4) Convert extra date columns to datetime in the cleaned merged df
         for col in extra_date_cols:
             if col in cleaned_df.columns:
-                cleaned_df[col] = pd.to_datetime(
-                    cleaned_df[col].astype(str).str.strip(),
-                    errors="coerce",
-                    format="mixed",
-                )
+                if not pd.api.types.is_datetime64_any_dtype(cleaned_df[col]):
+                    cleaned_df[col] = pd.to_datetime(
+                        cleaned_df[col].astype(str).str.strip(),
+                        errors="coerce",
+                        format="mixed",
+                    )
 
         # 5) Verify they really are datetime dtypes
         bad_cols = [
@@ -214,6 +192,7 @@ class Preprocessor:
             cleaned_df = cleaned_df.drop(columns=[key_extra])
 
         return cleaned_df
+
 
 
 
