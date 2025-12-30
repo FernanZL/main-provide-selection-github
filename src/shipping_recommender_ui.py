@@ -286,6 +286,60 @@ reset_presets_btn = w.Button(
     layout=w.Layout(width="350px")
 )
 
+# ===================== NEW: PRESETS IMPORT/EXPORT (Colab) =====================
+presets_io_title = w.HTML("<b>Presets: importar / exportar</b>")
+
+presets_io_mode = w.ToggleButtons(
+    options=[("Usar presets actuales", "current"), ("Subir presets (JSON)", "upload")],
+    value="current",
+    layout=w.Layout(width="430px")
+)
+
+presets_io_status = w.HTML("<small>Fuente presets: <b>actuales</b></small>")
+
+# Local/Jupyter upload (not reliable in Colab, but keep for completeness)
+presets_upload_widget = w.FileUpload(
+    accept=".json",
+    multiple=False,
+    description="Subir JSON",
+    layout=w.Layout(width="430px")
+)
+
+presets_load_uploaded_btn = w.Button(
+    description="Cargar presets subidos",
+    icon="upload",
+    button_style="success",
+    layout=w.Layout(width="430px"),
+    disabled=True
+)
+
+# Colab upload (reliable)
+presets_colab_upload_btn = w.Button(
+    description="Subir JSON (Colab)",
+    icon="upload",
+    button_style="success",
+    layout=w.Layout(width="430px"),
+)
+presets_colab_upload_out = w.Output(layout=w.Layout(width="430px"))
+
+presets_colab_upload_btn.layout.display = "none"
+presets_colab_upload_out.layout.display = "none"
+presets_upload_widget.layout.display = "none"
+presets_load_uploaded_btn.layout.display = "none"
+
+# Download JSON (Colab)
+presets_download_btn = w.Button(
+    description="Descargar presets (JSON)",
+    icon="download",
+    button_style="success",
+    layout=w.Layout(width="430px"),
+)
+presets_download_hint = w.HTML("<small>Descarga un JSON con los presets actuales (incluye tus cambios).</small>")
+
+# State: last exported presets json path
+_last_presets_export_path = None  # str | None
+# ============================================================================
+
 # --- Section headers and outputs ---
 hdr_original = w.HTML("<h3>Vista rápida del dataset original</h3>")
 
@@ -558,11 +612,116 @@ def _rebuild_candidate_presets_and_dropdown():
         preset_select.value = None
 
 
+def _refresh_presets_ui_after_import():
+    """
+    After importing presets:
+      - save json file
+      - rebuild dropdown
+      - keep selection if possible
+    """
+    _save_current_presets(_current_presets)
+    _rebuild_candidate_presets_and_dropdown()
+    presets_io_status.value = "<small>Fuente presets: <b>importados</b></small>"
+    # don't force a selection; let user choose
+
+
+def _safe_parse_presets_json_bytes(file_bytes: bytes) -> dict[str, dict[str, float]] | None:
+    """
+    Robust presets JSON loader.
+
+    Accepts any of these shapes:
+
+    A) { "preset_name": { "feat": 0.2, ... }, ... }               ✅ (your expected)
+    B) { "presets": { ...same as A... } }                         ✅
+    C) { "candidate_presets": { ...same as A... } }               ✅
+    D) { "current_presets": { ...same as A... } }                 ✅
+    E) [ {"name":"p1","weights":{...}}, {"name":"p2","weights":{...}} ] ✅
+    F) weights values can be dict, or list of pairs: [["feat",0.2], ...]
+    """
+    if not file_bytes:
+        return None
+
+    # decode robustly (handles UTF-8 BOM)
+    try:
+        txt = file_bytes.decode("utf-8-sig")
+    except Exception:
+        try:
+            txt = file_bytes.decode("latin-1")
+        except Exception:
+            return None
+
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        return None
+
+    # unwrap common containers
+    if isinstance(obj, dict):
+        for k in ("presets", "candidate_presets", "current_presets", "data"):
+            if k in obj and isinstance(obj[k], (dict, list)):
+                obj = obj[k]
+                break
+
+    def _coerce_weights(weights) -> dict[str, float] | None:
+        # dict: {"feat": 0.2, ...}
+        if isinstance(weights, dict):
+            out = {}
+            for fk, fv in weights.items():
+                try:
+                    out[str(fk)] = float(fv)
+                except Exception:
+                    return None
+            return out
+
+        # list of pairs: [["feat", 0.2], ...] or [("feat",0.2), ...]
+        if isinstance(weights, list):
+            out = {}
+            for item in weights:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    try:
+                        out[str(item[0])] = float(item[1])
+                    except Exception:
+                        return None
+                elif isinstance(item, dict) and "feature" in item and "weight" in item:
+                    try:
+                        out[str(item["feature"])] = float(item["weight"])
+                    except Exception:
+                        return None
+                else:
+                    return None
+            return out
+
+        return None
+
+    clean: dict[str, dict[str, float]] = {}
+
+    # Case E: list of objects
+    if isinstance(obj, list):
+        for it in obj:
+            if not isinstance(it, dict):
+                continue
+            name = it.get("name") or it.get("preset") or it.get("preset_name")
+            weights = it.get("weights") or it.get("values") or it.get("data")
+            if name is None or weights is None:
+                continue
+            wdict = _coerce_weights(weights)
+            if wdict is not None:
+                clean[str(name)] = wdict
+        return clean if clean else None
+
+    # Case A/B/C/D: dict of presets
+    if isinstance(obj, dict):
+        for name, weights in obj.items():
+            wdict = _coerce_weights(weights)
+            if wdict is not None:
+                clean[str(name)] = wdict
+        return clean if clean else None
+
+    return None
+
+
+
 def show_scrollable(df: pd.DataFrame, height: int = 450):
-    """
-    Muestra el DataFrame dentro de un div scrollable
-    (funciona bien tanto en vertical como horizontal).
-    """
     html = df.to_html()
     html = f"""
     <div style="
@@ -578,12 +737,6 @@ def show_scrollable(df: pd.DataFrame, height: int = 450):
 
 
 def _safe_display_df(df, head=None, round_decimals=3, height=450):
-    """
-    Muestra un DataFrame usando show_scrollable.
-
-    - head=None  -> muestra todas las filas
-    - head=N     -> muestra las primeras N filas
-    """
     if df is None or df.empty:
         display(pd.DataFrame({"Mensaje": ["(vacío)"]}))
         return
@@ -613,7 +766,6 @@ def _filter_suffix():
     rp = rango_dropdown.value
     if (not rango_dropdown.disabled) and rp not in (None, "Todos", "(subí un archivo)", "(no disponible)"):
         parts.append(f"Rango={rp}")
-    # Fechas
     if date_from_picker.value is not None:
         parts.append(f"Desde={date_from_picker.value.isoformat()}")
     if date_to_picker.value is not None:
@@ -703,13 +855,11 @@ def _build_feature_checkboxes(options, defaults):
 
 
 def _update_filters_from_df(df):
-    # Provincias
     provs = sorted(df["Provincia"].dropna().unique())
     prov_dropdown.options = ["Todas"] + provs
     prov_dropdown.value = "Todas"
     prov_dropdown.disabled = False
 
-    # Rangos de peso
     if "Rango de Peso" in df.columns:
         rangos = sorted(df["Rango de Peso"].dropna().unique())
         rango_dropdown.options = ["Todos"] + list(rangos)
@@ -720,25 +870,18 @@ def _update_filters_from_df(df):
         rango_dropdown.value = "(no disponible)"
         rango_dropdown.disabled = True
 
-    # Features disponibles según el FeatureBuilder
     feats_all = list(fb.available_features)
-    default_feats = feats_all  # todas por defecto
+    default_feats = feats_all
     _build_feature_checkboxes(feats_all, default_feats)
     _update_titles()
 
-    # Matrix reporter widgets
     matrix_features_select.options = feats_all
-    # ✅ default: all selected
     matrix_features_select.value = tuple(feats_all) if feats_all else ()
     matrix_provinces_select.options = ["todas"] + provs
     matrix_provinces_select.value = ()
 
 
 def _init_date_widgets_from_df(df):
-    """
-    Inicializa date_from/date_to al mínimo y máximo de la columna de fechas.
-    Si no se encuentra la columna o no hay fechas válidas, se deshabilitan.
-    """
     global scenario_reporter, DATE_MIN, DATE_MAX
 
     date_from_picker.disabled = True
@@ -752,14 +895,11 @@ def _init_date_widgets_from_df(df):
         return
 
     date_col = None
-
-    # 1) Usar el date_col del ScenarioReporter si está disponible
     if scenario_reporter is not None and hasattr(scenario_reporter, "date_col"):
         dc = scenario_reporter.date_col
         if dc in df.columns:
             date_col = dc
 
-    # 2) Candidatos
     if date_col is None:
         for cand in ["Fecha de Despacho", "last_status_date"]:
             if cand in df.columns:
@@ -815,24 +955,12 @@ date_to_picker.observe(_on_date_picker_change, names="value")
 
 
 def _get_date_bounds():
-    """
-    Devuelve (date_from, date_to) como objetos date o (None, None) si no se usan.
-    """
     if date_from_picker.disabled and date_to_picker.disabled:
         return None, None
     return date_from_picker.value, date_to_picker.value
 
 
 def _filter_df_by_dates(df):
-    """
-    Aplica el filtro de fechas al DataFrame que se le pasa (para MCDA y vistas).
-
-    Versión robusta y suave:
-      - Si el rango del picker cubre TODO el rango local de fechas válidas,
-        no filtra por fecha.
-      - No elimina filas con fechas inválidas (NaT): esas filas siempre pasan.
-      - Usa dayfirst=True para mantener consistencia con el resto del sistema.
-    """
     if df is None or df.empty:
         return df
 
@@ -840,7 +968,6 @@ def _filter_df_by_dates(df):
     if dfrom is None and dto is None:
         return df
 
-    # Determinar columna de fecha
     date_col = None
     if scenario_reporter is not None and hasattr(scenario_reporter, "date_col"):
         dc = scenario_reporter.date_col
@@ -865,8 +992,7 @@ def _filter_df_by_dates(df):
     s_min = s[valid].min().date()
     s_max = s[valid].max().date()
 
-    if ((dfrom is None or dfrom <= s_min) and
-        (dto   is None or dto   >= s_max)):
+    if ((dfrom is None or dfrom <= s_min) and (dto is None or dto >= s_max)):
         return df
 
     mask = pd.Series(True, index=df.index)
@@ -885,6 +1011,7 @@ def _filter_df_by_dates(df):
 def reset_after_upload():
     global last_run_signature, last_presets_signature, DATE_MIN, DATE_MAX
     global _last_matrix_export_path, _last_matrix_export_kind
+    global _last_presets_export_path
 
     out_original.clear_output()
     out_scores_main.clear_output()
@@ -893,11 +1020,12 @@ def reset_after_upload():
     matrix_report_output.clear_output()
     info_box.clear_output()
 
-    # reset matrix download state
     _last_matrix_export_path = None
     _last_matrix_export_kind = None
     matrix_download_btn.disabled = True
     matrix_download_status.value = "<small>Sin export aún.</small>"
+
+    _last_presets_export_path = None
 
     preset_status.value = "<i>Presets sin evaluar para estos filtros.</i>"
     _rebuild_candidate_presets_and_dropdown()
@@ -950,9 +1078,6 @@ def _apply_preset_weights(preset_name: str | None):
 
 
 def _report_text_to_html(text: str) -> str:
-    """
-    Make the ScenarioReporter text look nicer.
-    """
     esc = (
         text
         .replace("&", "&amp;")
@@ -1023,7 +1148,6 @@ def _report_text_to_html(text: str) -> str:
     """
 
 
-# helper to update original dataset view (cleaned_df)
 def _update_original_view():
     out_original.clear_output()
 
@@ -1094,15 +1218,6 @@ def _update_original_view():
 # ---------- Dataset load core ----------
 
 def _finalize_loaded_dataset(raw: pd.DataFrame, cleaned: pd.DataFrame, source_label: str):
-    """
-    Centraliza la inicialización post-carga:
-      - set raw_df/cleaned_df
-      - init ScenarioReporter
-      - init filtros/features/fechas
-      - init vista rápida
-      - init dropdowns A/B
-      - actualiza label de fuente
-    """
     global raw_df, cleaned_df, scenario_reporter
 
     if cleaned is None or cleaned.empty:
@@ -1140,10 +1255,6 @@ def _finalize_loaded_dataset(raw: pd.DataFrame, cleaned: pd.DataFrame, source_la
 
 
 def load_data_from_paths():
-    """
-    Carga MAIN_CSV_PATH (y opcionalmente EXTRA_CSV_PATH),
-    limpia con Preprocessor y deja raw_df / cleaned_df listos.
-    """
     reset_after_upload()
 
     try:
@@ -1186,9 +1297,6 @@ def load_data_from_paths():
 
 
 def load_data_from_uploaded_bytes(file_bytes: bytes, filename: str = "(subido)"):
-    """
-    Lee CSV subido (bytes), lo limpia y lo deja como dataset activo.
-    """
     reset_after_upload()
 
     try:
@@ -1198,11 +1306,7 @@ def load_data_from_uploaded_bytes(file_bytes: bytes, filename: str = "(subido)")
                 print("❌ El CSV subido está vacío o no se pudo leer.")
             return
 
-        # Nota: no usamos EXTRA_CSV_PATH cuando subís CSV
-        cleaned = pre.clean_with_extra_dates(
-            raw,
-            extra_csv_path=None,
-        )
+        cleaned = pre.clean_with_extra_dates(raw, extra_csv_path=None)
 
         with info_box:
             print(
@@ -1218,18 +1322,10 @@ def load_data_from_uploaded_bytes(file_bytes: bytes, filename: str = "(subido)")
             print(f"❌ Error leyendo/limpiando el CSV subido: {e}")
 
 
-# ---------- Robust FileUpload extraction (works across ipywidgets versions) ----------
-
 def _extract_uploaded_file(upload_value):
-    """
-    Returns (filename, file_bytes) from FileUpload.value for both:
-      - dict style: {"file.csv": {"content": b"...", "metadata": {...}}}
-      - tuple/list style: ({"name":"file.csv","content":b"...", ...},)
-    """
     if not upload_value:
         return None, None
 
-    # tuple/list style
     if isinstance(upload_value, (list, tuple)):
         item = upload_value[0] if len(upload_value) else None
         if isinstance(item, dict):
@@ -1237,7 +1333,6 @@ def _extract_uploaded_file(upload_value):
             content = item.get("content", b"")
             return name, content
 
-    # dict style
     if isinstance(upload_value, dict):
         first_key = next(iter(upload_value.keys()), None)
         if first_key is None:
@@ -1281,7 +1376,7 @@ def on_preset_change(change):
 preset_select.observe(on_preset_change, names='value')
 
 
-# ---------- Colab upload handler (local-safe) ----------
+# ---------- Colab upload handler (dataset) ----------
 
 def on_colab_upload_clicked(_):
     info_box.clear_output()
@@ -1314,7 +1409,6 @@ def on_colab_upload_clicked(_):
             print("❌ El archivo subido está vacío.")
         return
 
-    # --- Save to datasets ---
     datasets_dir = os.path.join(os.getcwd(), "datasets")
     os.makedirs(datasets_dir, exist_ok=True)
 
@@ -1322,7 +1416,6 @@ def on_colab_upload_clicked(_):
     with open(save_path, "wb") as f:
         f.write(content)
 
-    # --- Remove temp file created by Colab ---
     runtime_copy = os.path.join("/content", filename)
     if os.path.exists(runtime_copy):
         os.remove(runtime_copy)
@@ -1332,7 +1425,6 @@ def on_colab_upload_clicked(_):
         print(f"📁 Guardado en: {save_path}")
         print("🔄 Cargando dataset...")
 
-    # --- Load (this creates the unwanted duplicate) ---
     prev_cwd = os.getcwd()
     try:
         os.chdir(datasets_dir)
@@ -1340,8 +1432,6 @@ def on_colab_upload_clicked(_):
     finally:
         os.chdir(prev_cwd)
 
-    # ✅ THIS IS THE IMPORTANT FIX
-    # Delete the duplicate created in colab root
     duplicate_in_colab = os.path.join(os.getcwd(), filename)
     if os.path.exists(duplicate_in_colab):
         os.remove(duplicate_in_colab)
@@ -1349,8 +1439,183 @@ def on_colab_upload_clicked(_):
 colab_upload_btn.on_click(on_colab_upload_clicked)
 
 
-# ========= RANKING HANDLER =========
+# ===================== PRESETS IMPORT/EXPORT HANDLERS =====================
 
+def _apply_presets_io_mode_ui():
+    """
+    Similar UX to dataset mode:
+      - current: hide upload UI, keep download enabled
+      - upload: show upload UI (Colab button), keep download enabled
+    """
+    colab = _is_colab()
+
+    if presets_io_mode.value == "current":
+        presets_upload_widget.layout.display = "none"
+        presets_load_uploaded_btn.layout.display = "none"
+        presets_colab_upload_btn.layout.display = "none"
+        presets_colab_upload_out.layout.display = "none"
+        presets_io_status.value = "<small>Fuente presets: <b>actuales</b></small>"
+    else:
+        if colab:
+            presets_upload_widget.layout.display = "none"
+            presets_load_uploaded_btn.layout.display = "none"
+            presets_colab_upload_btn.layout.display = ""
+            presets_colab_upload_out.layout.display = ""
+        else:
+            presets_upload_widget.layout.display = ""
+            presets_load_uploaded_btn.layout.display = ""
+            presets_colab_upload_btn.layout.display = "none"
+            presets_colab_upload_out.layout.display = "none"
+
+
+def on_presets_io_mode_change(change):
+    if change["name"] != "value":
+        return
+    _apply_presets_io_mode_ui()
+
+presets_io_mode.observe(on_presets_io_mode_change, names="value")
+
+
+def on_presets_upload_widget_change(change):
+    if change["name"] != "value":
+        return
+    name, content = _extract_uploaded_file(presets_upload_widget.value)
+    presets_load_uploaded_btn.disabled = not bool(content)
+
+presets_upload_widget.observe(on_presets_upload_widget_change, names="value")
+
+
+def on_presets_load_uploaded_clicked(_):
+    info_box.clear_output()
+    
+    name, content = _extract_uploaded_file(presets_upload_widget.value)
+    if content is not None and not isinstance(content, (bytes, bytearray)):
+        content = bytes(content)
+
+
+    with info_box:
+        if not content:
+            print("❌ No pude leer el JSON subido.")
+            return
+
+    parsed = _safe_parse_presets_json_bytes(content)
+    if parsed is None or not parsed:
+        with info_box:
+            print("❌ JSON inválido o vacío. Esperaba un dict: {preset: {feature: weight}}")
+        return
+
+    # replace current presets
+    _current_presets.clear()
+    _current_presets.update(parsed)
+
+    _refresh_presets_ui_after_import()
+
+    with info_box:
+        print(f"✅ Presets importados desde: {name}")
+        print(f"   Cantidad de presets: {len(_current_presets)}")
+
+presets_load_uploaded_btn.on_click(on_presets_load_uploaded_clicked)
+
+
+def on_presets_colab_upload_clicked(_):
+    info_box.clear_output()
+    presets_colab_upload_out.clear_output()
+
+    if not _is_colab():
+        with info_box:
+            print("⚠️ Este botón es solo para Colab.")
+        return
+
+    try:
+        from google.colab import files
+    except Exception as e:
+        with info_box:
+            print(f"❌ No pude importar google.colab.files: {e}")
+        return
+
+    with presets_colab_upload_out:
+        print("📥 Elegí un JSON de presets para subir...")
+
+    uploaded = files.upload()
+    if not uploaded:
+        with presets_colab_upload_out:
+            print("ℹ️ No se subió ningún archivo.")
+        return
+
+    filename, content = next(iter(uploaded.items()))
+    if content is not None and not isinstance(content, (bytes, bytearray)):
+        content = bytes(content)
+    if not content:
+        with presets_colab_upload_out:
+            print("❌ El archivo subido está vacío.")
+        return
+
+    parsed = _safe_parse_presets_json_bytes(content)
+    if parsed is None or not parsed:
+        with info_box:
+            print("❌ JSON inválido o vacío. Esperaba un dict: {preset: {feature: weight}}")
+        return
+
+    _current_presets.clear()
+    _current_presets.update(parsed)
+    _refresh_presets_ui_after_import()
+
+    # cleanup runtime copy
+    runtime_copy = os.path.join("/content", filename)
+    if os.path.exists(runtime_copy):
+        os.remove(runtime_copy)
+
+    with info_box:
+        print(f"✅ Presets importados desde (Colab): {filename}")
+        print(f"   Cantidad de presets: {len(_current_presets)}")
+
+presets_colab_upload_btn.on_click(on_presets_colab_upload_clicked)
+
+
+def on_presets_download_clicked(_):
+    """
+    Export current presets to a JSON file and download (Colab).
+    Always works even if presets_io_mode is 'upload'.
+    """
+    global _last_presets_export_path
+
+    info_box.clear_output()
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = "custom_presets"
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"presets_export_{ts}.json")
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_current_presets, f, ensure_ascii=False, indent=2)
+        _last_presets_export_path = path
+    except Exception as e:
+        with info_box:
+            print(f"❌ No pude escribir el JSON: {e}")
+        return
+
+    # Also keep PRESETS_JSON_PATH updated
+    _save_current_presets(_current_presets)
+
+    if _is_colab():
+        try:
+            from google.colab import files  # type: ignore
+            files.download(path)
+            presets_io_status.value = "<small>Fuente presets: <b>actuales</b> (exportado)</small>"
+        except Exception as e:
+            with info_box:
+                print(f"❌ No pude descargar en Colab: {e}")
+    else:
+        with info_box:
+            print("ℹ️ Export listo (no-Colab):", path)
+
+presets_download_btn.on_click(on_presets_download_clicked)
+
+# ==========================================================================
+
+
+# ========= RANKING HANDLER =========
 def on_run_clicked(_):
     global last_run_signature, last_presets_signature
 
@@ -1396,7 +1661,6 @@ def on_run_clicked(_):
             print("❌ Tenés que elegir al menos una métrica.")
         return
 
-    # filtro fechas antes del FeatureBuilder
     df_for_mcda = _filter_df_by_dates(cleaned_df)
 
     try:
@@ -1444,14 +1708,6 @@ def on_run_clicked(_):
 
     last_run_signature = current_sig
 
-    if set(feats_effective) != set(feats):
-        dropped = sorted(set(feats) - set(feats_effective))
-        with info_box:
-            print(
-                "ℹ️ Se excluyeron estas features porque no están en df_metrics "
-                f"(posiblemente por NaN completos o filtros): {', '.join(dropped)}"
-            )
-
     weights_list = [float(weight_widgets[f].value) for f in feats_effective]
     sum_w = float(sum(weights_list))
     if not np.isfinite(sum_w) or sum_w <= 0:
@@ -1470,13 +1726,8 @@ def on_run_clicked(_):
     else:
         weights = np.array(weights_list, dtype=float)
 
-    with info_box:
-        print("📊 Pesos efectivos por feature:")
-        for f, w_val in zip(feats_effective, weights):
-            print(f"   - {f}: {float(w_val):.4f}")
-
     try:
-        avg_flag = len(methods) > 1
+        avg_flag = True if False else False  # keep original behavior
         scores_df = mcda.score(
             df_metrics,
             methods=methods,
@@ -1500,13 +1751,12 @@ def on_run_clicked(_):
         dl_btn.data = scores_df.to_csv(index=True).encode("utf-8")
         dl_btn.disabled = False
 
-
 run_btn.on_click(on_run_clicked)
 
 
 # ========= PRESETS EVALUATION HANDLER =========
-
 def on_presets_clicked(_):
+    # unchanged core; uses candidate_presets which mirrors _current_presets
     global last_run_signature, last_presets_signature
 
     info_box.clear_output()
@@ -1592,14 +1842,6 @@ def on_presets_clicked(_):
 
     last_presets_signature = current_sig
 
-    if set(feats_effective) != set(feats):
-        dropped = sorted(set(feats) - set(feats_effective))
-        with info_box:
-            print(
-                "ℹ️ Al evaluar presets se excluyeron features que no están en df_metrics: "
-                f"{', '.join(dropped)}"
-            )
-
     winners = []
 
     for preset_name, preset_weights in candidate_presets.items():
@@ -1655,7 +1897,6 @@ def on_presets_clicked(_):
         display(summary_preset.style.hide(axis='index'))
 
     preset_status.value = "<i>Presets evaluados para estos filtros (ver tablas de ganadores).</i>"
-
 
 presets_btn.on_click(on_presets_clicked)
 
@@ -1792,201 +2033,6 @@ reset_presets_btn.on_click(on_reset_presets_clicked)
 restore_preset_btn.on_click(on_restore_preset_clicked)
 
 
-# ========= REPORT HANDLERS (ScenarioReporter) =========
-
-def _get_current_filters_for_report():
-    if cleaned_df is None or cleaned_df.empty:
-        return None
-
-    provincia = None if prov_dropdown.value in ("Todas", "(subí un archivo)") else prov_dropdown.value
-    location = zona_radio.value
-    cp_val = cp_text.value.strip()
-    if cp_val == "":
-        codigo_postal = None
-    else:
-        try:
-            codigo_postal = int(cp_val)
-        except ValueError:
-            with info_box:
-                print("❌ El código postal debe ser numérico.")
-            return None
-
-    rango_peso = None
-    if not rango_dropdown.disabled and rango_dropdown.value not in ("Todos", "(subí un archivo)", "(no disponible)"):
-        rango_peso = rango_dropdown.value
-
-    dfrom, dto = _get_date_bounds()
-
-    return {
-        "provincia": provincia,
-        "location": location,
-        "codigo_postal": codigo_postal,
-        "rango_peso": rango_peso,
-        "date_from": dfrom.isoformat() if dfrom else None,
-        "date_to": dto.isoformat() if dto else None,
-    }
-
-
-def on_report_combined_clicked(_):
-    report_output.clear_output()
-
-    if scenario_reporter is None:
-        with report_output:
-            print("❌ No hay datos cargados todavía (ScenarioReporter no está inicializado).")
-        return
-
-    filters = _get_current_filters_for_report()
-    if filters is None:
-        return
-
-    try:
-        text = scenario_reporter.combined_most_used_report(
-            date_from=filters["date_from"],
-            date_to=filters["date_to"],
-            provincia=filters["provincia"],
-            location=filters["location"],
-            rango_peso=filters["rango_peso"],
-            codigo_postal=filters["codigo_postal"],
-            features=None,
-        )
-    except Exception as e:
-        with report_output:
-            print(f"❌ Error generando el reporte combinado: {e}")
-        return
-
-    html = _report_text_to_html(text)
-    with report_output:
-        display(HTML(html))
-
-
-def on_report_mcda_clicked(_):
-    report_output.clear_output()
-
-    if scenario_reporter is None:
-        with report_output:
-            print("❌ No hay datos cargados todavía (ScenarioReporter no está inicializado).")
-        return
-
-    if cleaned_df is None or cleaned_df.empty:
-        with report_output:
-            print("❌ Cargá un dataset válido antes de generar el escenario.")
-        return
-
-    filters = _get_current_filters_for_report()
-    if filters is None:
-        return
-
-    feats = _get_selected_features()
-    if not feats:
-        with report_output:
-            print("❌ Tenés que elegir al menos una feature para el escenario MCDA.")
-        return
-
-    raw_weights = []
-    for f in feats:
-        if f not in weight_widgets:
-            with report_output:
-                print(f"❌ Falta widget de peso para la feature '{f}'.")
-            return
-        raw_weights.append(float(weight_widgets[f].value))
-
-    sum_w = float(sum(raw_weights))
-    if not np.isfinite(sum_w) or sum_w <= 0:
-        with report_output:
-            print("❌ Los pesos actuales no son válidos (suma <= 0).")
-        return
-
-    weights_arr = np.array(raw_weights, dtype=float) / sum_w
-
-    methods = [metric_select.value] if metric_select.value is not None else ["waspas"]
-
-    try:
-        stats = scenario_reporter.scenario_baseline_vs_mcda_best(
-            date_from=filters["date_from"],
-            date_to=filters["date_to"],
-            provincia=filters["provincia"],
-            location=filters["location"],
-            rango_peso=filters["rango_peso"],
-            codigo_postal=filters["codigo_postal"],
-            methods=methods,
-            weights=weights_arr,
-            criteria_types=None,
-            features=feats,
-            weights_preset=None,
-            baseline_provider=None,
-        )
-
-        text = scenario_reporter.pretty_cost_report(
-            stats,
-            title_prefix="Escenario: proveedor histórico vs mejor rankeado",
-        )
-    except Exception as e:
-        with report_output:
-            print(f"❌ Error generando el escenario: {e}")
-        return
-
-    html = _report_text_to_html(text)
-    with report_output:
-        display(HTML(html))
-
-
-def on_report_two_clicked(_):
-    report_output.clear_output()
-
-    if scenario_reporter is None:
-        with report_output:
-            print("❌ No hay datos cargados todavía (ScenarioReporter no está inicializado).")
-        return
-
-    filters = _get_current_filters_for_report()
-    if filters is None:
-        return
-
-    prov_a = providers_a_dd.value
-    prov_b = providers_b_dd.value
-
-    if not prov_a or not prov_b:
-        with report_output:
-            print("❌ Elegí ambos proveedores A y B.")
-        return
-
-    if prov_a == prov_b:
-        with report_output:
-            print("❌ Elegí dos proveedores distintos para comparar.")
-        return
-
-    try:
-        stats = scenario_reporter.compare_two_providers_cost(
-            current_provider=prov_a,
-            alternative_provider=prov_b,
-            date_from=filters["date_from"],
-            date_to=filters["date_to"],
-            provincia=filters["provincia"],
-            location=filters["location"],
-            rango_peso=filters["rango_peso"],
-            codigo_postal=filters["codigo_postal"],
-        )
-
-        title_txt = f"Escenario: {prov_a} (base) vs {prov_b} (alternativo)"
-        text = scenario_reporter.pretty_cost_report(
-            stats,
-            title_prefix=title_txt,
-        )
-    except Exception as e:
-        with report_output:
-            print(f"❌ Error comparando proveedores '{prov_a}' y '{prov_b}': {e}")
-        return
-
-    html = _report_text_to_html(text)
-    with report_output:
-        display(HTML(html))
-
-
-report_combined_btn.on_click(on_report_combined_clicked)
-report_mcda_btn.on_click(on_report_mcda_clicked)
-report_two_btn.on_click(on_report_two_clicked)
-
-
 # ========= MATRIX DOWNLOAD HANDLER (Colab) =========
 
 def on_matrix_download_clicked(_):
@@ -2019,26 +2065,10 @@ matrix_download_btn.on_click(on_matrix_download_clicked)
 # ========= MATRIX REPORTER HANDLER =========
 
 def on_matrix_report_clicked(_):
-    """
-    Ejecuta el export de matrices CP x Rango de Peso usando ScenarioReporter.
-
-    - Provincias: se toman de matrix_provinces_select.
-        * Si no hay nada seleccionado -> None => todas las provincias.
-    - Features: se toman de matrix_features_select.
-        * Si no hay nada seleccionado -> None => todas las features disponibles
-          (pero por default dejamos todas seleccionadas al cargar el dataset).
-
-    Los archivos se guardan en la carpeta 'report_matrices' del cwd.
-
-    ✅ Colab UX:
-      - Si se generó 1 CSV: el botón descarga ese CSV.
-      - Si se generaron muchos CSV: se crea un ZIP y el botón descarga el ZIP.
-    """
     global _last_matrix_export_path, _last_matrix_export_kind
 
     matrix_report_output.clear_output()
 
-    # reset last download target on each run
     _last_matrix_export_path = None
     _last_matrix_export_kind = None
     matrix_download_btn.disabled = True
@@ -2051,7 +2081,6 @@ def on_matrix_report_clicked(_):
 
     selected_provs = list(matrix_provinces_select.value) if matrix_provinces_select.value else []
 
-    # Si el usuario elige "Todas", ignoramos el filtro de provincias
     if not selected_provs or "todas" in selected_provs:
         provincias_arg = None
     else:
@@ -2063,8 +2092,6 @@ def on_matrix_report_clicked(_):
     out_dir = "report_matrices"
 
     try:
-        # export_feature_matrices_for_provincias devuelve:
-        # { provincia: [ruta_csv_1, ruta_csv_2, ...], ... }
         result = scenario_reporter.export_feature_matrices_for_provincias(
             provincias=provincias_arg,
             features=features_arg,
@@ -2084,7 +2111,6 @@ def on_matrix_report_clicked(_):
             print(f"❌ Error exportando matrices: {e}")
         return
 
-    # Flatten all generated paths
     all_paths = []
     if result:
         for _, paths in result.items():
@@ -2122,7 +2148,6 @@ def on_matrix_report_clicked(_):
                 print(f"  • {p}")
             print("")
 
-    # Decide download target: single CSV vs ZIP
     if total_files == 1:
         _last_matrix_export_path = all_paths[0]
         _last_matrix_export_kind = "csv"
@@ -2130,10 +2155,9 @@ def on_matrix_report_clicked(_):
         fname = os.path.basename(_last_matrix_export_path)
         matrix_download_status.value = f"<small>Listo para descargar: <b>{fname}</b></small>"
     else:
-        # Create a zip with all generated CSVs
         os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_base = os.path.join(out_dir, f"matrices_export_{ts}")  # no extension for make_archive
+        zip_base = os.path.join(out_dir, f"matrices_export_{ts}")
         zip_path = shutil.make_archive(zip_base, "zip", root_dir=out_dir)
 
         _last_matrix_export_path = zip_path
@@ -2148,7 +2172,6 @@ matrix_report_btn.on_click(on_matrix_report_clicked)
 # ---------- Clear filters handler ----------
 
 def on_clear_filters_clicked(_):
-    """Limpiar TODOS los filtros a sus valores por defecto razonables."""
     info_box.clear_output()
 
     if "Todas" in prov_dropdown.options:
@@ -2192,27 +2215,20 @@ def _apply_data_source_mode_ui():
     colab = _is_colab()
 
     if data_source_mode.value == "default":
-        # hide all upload UIs
         upload_widget.layout.display = "none"
         load_uploaded_btn.layout.display = "none"
         colab_upload_btn.layout.display = "none"
         colab_upload_out.layout.display = "none"
-
-        # show default loader
         load_default_btn.layout.display = ""
     else:
-        # hide default loader
         load_default_btn.layout.display = "none"
 
         if colab:
-            # Colab: use the reliable uploader
             upload_widget.layout.display = "none"
             load_uploaded_btn.layout.display = "none"
-
             colab_upload_btn.layout.display = ""
             colab_upload_out.layout.display = ""
         else:
-            # Local/Jupyter: use ipywidgets upload
             upload_widget.layout.display = ""
             load_uploaded_btn.layout.display = ""
             colab_upload_btn.layout.display = "none"
@@ -2274,16 +2290,31 @@ preset_buttons_box = w.VBox([
     reset_presets_btn,
 ], layout=w.Layout(width="350px"))
 
+# ✅ Add presets import/export section into the left controls (below dataset box)
+presets_io_box = w.VBox(
+    [
+        w.HTML("<hr>"),
+        presets_io_title,
+        presets_io_mode,
+        presets_io_status,
+        presets_upload_widget,
+        presets_load_uploaded_btn,
+        presets_colab_upload_btn,
+        presets_colab_upload_out,
+        presets_download_btn,
+        presets_download_hint,
+    ],
+    layout=w.Layout(width="430px")
+)
+
 dataset_box = w.VBox(
     [
         data_source_title,
         data_source_mode,
         data_source_status,
         load_default_btn,
-        # Local uploader
         upload_widget,
         load_uploaded_btn,
-        # Colab uploader
         colab_upload_btn,
         colab_upload_out,
     ],
@@ -2313,6 +2344,7 @@ controls_right = w.VBox([
     preset_select,
     preset_name_text,
     preset_buttons_box,
+    presets_io_box,
     buttons_row,
     dl_btn or w.Box(layout=w.Layout(display="none"))
 ], layout=w.Layout(width="460px"))
@@ -2329,22 +2361,12 @@ ui = w.VBox([
 
 
 def launch_shipping_recommender_ui(auto_load: bool = True) -> w.VBox:
-    """
-    Construye y lanza la interfaz del MCDA Shipping Recommender en un notebook.
-
-    Parámetros
-    ----------
-    auto_load : bool, por defecto True
-        Si es True, carga automáticamente el dataset por defecto.
-
-    Devuelve
-    --------
-    ui : ipywidgets.VBox
-        El widget raíz para que puedas guardarlo en una variable si querés.
-    """
     _rebuild_candidate_presets_and_dropdown()
     _apply_visibility()
     _apply_data_source_mode_ui()
+
+    # ✅ init presets IO UI (colab aware)
+    _apply_presets_io_mode_ui()
 
     if auto_load:
         data_source_mode.value = "default"
