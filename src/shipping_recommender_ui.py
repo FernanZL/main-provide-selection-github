@@ -1,5 +1,8 @@
 # ---- MCDA Shipping Recommender UI ----
 import sys, os, io, json, re
+import shutil
+from datetime import datetime
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname("__file__"), "..")))
 
 import numpy as np
@@ -428,6 +431,20 @@ matrix_report_output = w.Output(
     )
 )
 
+# ✅ NEW (Colab): download last export (CSV if single, ZIP if many)
+matrix_download_btn = w.Button(
+    description="Descargar último export",
+    icon="download",
+    button_style="success",
+    layout=w.Layout(width="260px"),
+    disabled=True,
+)
+matrix_download_status = w.HTML("<small>Sin export aún.</small>")
+
+# State: where the last export file is (CSV or ZIP)
+_last_matrix_export_path = None  # str | None
+_last_matrix_export_kind = None  # "csv" | "zip" | None
+
 matrix_controls_row = w.HBox(
     [matrix_features_select, matrix_provinces_select, matrix_report_btn],
     layout=w.Layout(width="100%", justify_content="flex-start", gap="10px")
@@ -448,6 +465,7 @@ matrix_box = w.VBox(
         matrix_hdr,
         matrix_controls_row,
         matrix_report_output,
+        w.HBox([matrix_download_btn, matrix_download_status], layout=w.Layout(gap="10px")),
     ],
     layout=w.Layout(width="100%", margin="10px 0 0 0")
 )
@@ -866,6 +884,7 @@ def _filter_df_by_dates(df):
 
 def reset_after_upload():
     global last_run_signature, last_presets_signature, DATE_MIN, DATE_MAX
+    global _last_matrix_export_path, _last_matrix_export_kind
 
     out_original.clear_output()
     out_scores_main.clear_output()
@@ -873,6 +892,13 @@ def reset_after_upload():
     report_output.clear_output()
     matrix_report_output.clear_output()
     info_box.clear_output()
+
+    # reset matrix download state
+    _last_matrix_export_path = None
+    _last_matrix_export_kind = None
+    matrix_download_btn.disabled = True
+    matrix_download_status.value = "<small>Sin export aún.</small>"
+
     preset_status.value = "<i>Presets sin evaluar para estos filtros.</i>"
     _rebuild_candidate_presets_and_dropdown()
     preset_select.value = None
@@ -1321,8 +1347,6 @@ def on_colab_upload_clicked(_):
         os.remove(duplicate_in_colab)
 
 colab_upload_btn.on_click(on_colab_upload_clicked)
-
-
 
 
 # ========= RANKING HANDLER =========
@@ -1963,6 +1987,35 @@ report_mcda_btn.on_click(on_report_mcda_clicked)
 report_two_btn.on_click(on_report_two_clicked)
 
 
+# ========= MATRIX DOWNLOAD HANDLER (Colab) =========
+
+def on_matrix_download_clicked(_):
+    global _last_matrix_export_path, _last_matrix_export_kind
+
+    info_box.clear_output()
+
+    if not _is_colab():
+        with info_box:
+            print("⚠️ Descargar con botón está pensado para Colab.")
+        return
+
+    if (not _last_matrix_export_path) or (not os.path.exists(_last_matrix_export_path)):
+        with info_box:
+            print("❌ No hay un export válido para descargar (o el archivo ya no existe).")
+        matrix_download_btn.disabled = True
+        matrix_download_status.value = "<small>Sin export válido.</small>"
+        return
+
+    try:
+        from google.colab import files  # type: ignore
+        files.download(_last_matrix_export_path)
+    except Exception as e:
+        with info_box:
+            print(f"❌ Error descargando: {e}")
+
+matrix_download_btn.on_click(on_matrix_download_clicked)
+
+
 # ========= MATRIX REPORTER HANDLER =========
 
 def on_matrix_report_clicked(_):
@@ -1976,8 +2029,20 @@ def on_matrix_report_clicked(_):
           (pero por default dejamos todas seleccionadas al cargar el dataset).
 
     Los archivos se guardan en la carpeta 'report_matrices' del cwd.
+
+    ✅ Colab UX:
+      - Si se generó 1 CSV: el botón descarga ese CSV.
+      - Si se generaron muchos CSV: se crea un ZIP y el botón descarga el ZIP.
     """
+    global _last_matrix_export_path, _last_matrix_export_kind
+
     matrix_report_output.clear_output()
+
+    # reset last download target on each run
+    _last_matrix_export_path = None
+    _last_matrix_export_kind = None
+    matrix_download_btn.disabled = True
+    matrix_download_status.value = "<small>Sin export aún.</small>"
 
     if scenario_reporter is None:
         with matrix_report_output:
@@ -1995,13 +2060,15 @@ def on_matrix_report_clicked(_):
     selected_feats = list(matrix_features_select.value) if matrix_features_select.value else []
     features_arg = selected_feats or None
 
+    out_dir = "report_matrices"
+
     try:
         # export_feature_matrices_for_provincias devuelve:
         # { provincia: [ruta_csv_1, ruta_csv_2, ...], ... }
         result = scenario_reporter.export_feature_matrices_for_provincias(
             provincias=provincias_arg,
             features=features_arg,
-            out_dir="report_matrices",
+            out_dir=out_dir,
         )
     except AttributeError:
         with matrix_report_output:
@@ -2017,12 +2084,19 @@ def on_matrix_report_clicked(_):
             print(f"❌ Error exportando matrices: {e}")
         return
 
+    # Flatten all generated paths
+    all_paths = []
+    if result:
+        for _, paths in result.items():
+            if paths:
+                all_paths.extend(list(paths))
+
     with matrix_report_output:
-        if not result:
+        if not result or not all_paths:
             print("ℹ️ No se generó ningún archivo (quizás no había datos suficientes).")
             return
 
-        total_files = sum(len(paths) for paths in result.values())
+        total_files = len(all_paths)
 
         if provincias_arg is None:
             prov_msg = "todas las provincias del dataset"
@@ -2037,7 +2111,7 @@ def on_matrix_report_clicked(_):
         print("✅ Exportación de matrices completada (CSV).")
         print(f"   Provincias usadas: {prov_msg}")
         print(f"   Features usadas: {feat_msg}")
-        print("   Carpeta destino: report_matrices")
+        print(f"   Carpeta destino: {out_dir}")
         print(f"   Archivos generados: {total_files}\n")
 
         for prov, paths in result.items():
@@ -2048,6 +2122,25 @@ def on_matrix_report_clicked(_):
                 print(f"  • {p}")
             print("")
 
+    # Decide download target: single CSV vs ZIP
+    if total_files == 1:
+        _last_matrix_export_path = all_paths[0]
+        _last_matrix_export_kind = "csv"
+        matrix_download_btn.disabled = False
+        fname = os.path.basename(_last_matrix_export_path)
+        matrix_download_status.value = f"<small>Listo para descargar: <b>{fname}</b></small>"
+    else:
+        # Create a zip with all generated CSVs
+        os.makedirs(out_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_base = os.path.join(out_dir, f"matrices_export_{ts}")  # no extension for make_archive
+        zip_path = shutil.make_archive(zip_base, "zip", root_dir=out_dir)
+
+        _last_matrix_export_path = zip_path
+        _last_matrix_export_kind = "zip"
+        matrix_download_btn.disabled = False
+        fname = os.path.basename(_last_matrix_export_path)
+        matrix_download_status.value = f"<small>Listo para descargar ZIP: <b>{fname}</b></small>"
 
 matrix_report_btn.on_click(on_matrix_report_clicked)
 
@@ -2081,7 +2174,6 @@ def on_clear_filters_clicked(_):
 
     _update_titles()
     preset_status.value = "<i>Presets sin evaluar para estos filtros.</i>"
-
 
 clear_filters_btn.on_click(on_clear_filters_clicked)
 
