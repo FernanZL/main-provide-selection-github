@@ -397,63 +397,8 @@ section_original = w.VBox(
 )
 section_scores   = w.VBox([hdr_scores,   scores_row],   layout=w.Layout(display=''))
 
-# === Report widgets (ScenarioReporter) ===
-hdr_report = w.HTML("<h3>Reportes de escenarios</h3>")
-
-report_output = w.Output(
-    layout=w.Layout(
-        border="none",
-        max_height="400px",
-        overflow_y="auto",
-        width="100%",
-        margin="0 0 10px 0",
-    )
-)
-
-# Dropdowns para comparación directa de proveedores
-providers_a_dd = w.Dropdown(
-    options=[("(sin datos)", None)],
-    value=None,
-    description="Proveedor A:",
-    layout=w.Layout(width="260px")
-)
-providers_b_dd = w.Dropdown(
-    options=[("(sin datos)", None)],
-    value=None,
-    description="Proveedor B:",
-    layout=w.Layout(width="260px")
-)
-
-report_combined_btn = w.Button(
-    description="Reporte combinado: métricas + costos",
-    icon="file-text",
-    layout=w.Layout(width="280px")
-)
-
-report_mcda_btn = w.Button(
-    description="Comparar: más elegido vs #1 en simulación",
-    icon="search",
-    layout=w.Layout(width="260px")
-)
-
-report_two_btn = w.Button(
-    description="Escenario: proveedor A vs B",
-    icon="exchange",
-    layout=w.Layout(width="260px")
-)
-
-report_provider_row = w.HBox(
-    [providers_a_dd, providers_b_dd],
-    layout=w.Layout(width="100%", justify_content="flex-start", gap="10px")
-)
-
-report_buttons_row = w.HBox(
-    [report_combined_btn, report_mcda_btn, report_two_btn],
-    layout=w.Layout(width="100%", justify_content="flex-start", gap="10px", margin="5px 0 10px 0")
-)
-
 # === Matrix reporter widgets (CSV) ===
-matrix_hdr = w.HTML("<h4>Reportes de matrices (CSV)</h4>")
+hdr_matrix = w.HTML("<h3>Matrices (export CSV)</h3>")
 
 matrix_features_select = w.SelectMultiple(
     options=[],
@@ -504,46 +449,27 @@ matrix_controls_row = w.HBox(
     layout=w.Layout(width="100%", justify_content="flex-start", gap="10px")
 )
 
-# --- Separate containers for scenario reports and matrix reports (to avoid overlap) ---
-report_box = w.VBox(
+section_matrix = w.VBox(
     [
-        report_provider_row,
-        report_buttons_row,
-        report_output,
-    ],
-    layout=w.Layout(width="100%")
-)
-
-matrix_box = w.VBox(
-    [
-        matrix_hdr,
+        hdr_matrix,
         matrix_controls_row,
         matrix_report_output,
         w.HBox([matrix_download_btn, matrix_download_status], layout=w.Layout(gap="10px")),
     ],
-    layout=w.Layout(width="100%", margin="10px 0 0 0")
-)
-
-section_report = w.VBox(
-    [
-        hdr_report,
-        report_box,
-        w.HTML("<hr>"),
-        matrix_box,
-    ],
     layout=w.Layout(display='none')
 )
+
 
 # Toggles (solo original, ranking, reportes)
 toggle_original = w.Checkbox(value=False, description="Mostrar 'Vista rápida del dataset'")
 toggle_scores   = w.Checkbox(value=True,  description="Mostrar 'Ranking de proveedores'")
-toggle_report   = w.Checkbox(value=False, description="Mostrar 'Reportes de escenarios'")
+toggle_matrix   = w.Checkbox(value=False, description="Mostrar 'Matrices (export CSV)'")
 
-for t in (toggle_original, toggle_scores, toggle_report):
+for t in (toggle_original, toggle_scores, toggle_matrix):
     t.layout = w.Layout(width="100%")
 
 toggles_grid = w.GridBox(
-    children=[toggle_original, toggle_scores, toggle_report],
+    children=[toggle_original, toggle_scores, toggle_matrix],
     layout=w.Layout(
         width="100%",
         grid_template_columns="repeat(3, minmax(260px, 1fr))",
@@ -775,10 +701,9 @@ def _filter_suffix():
         return ""
     return " — Filtros: " + ", ".join(parts)
 
-
 def _update_titles():
     hdr_scores.value  = f"<h3>Ranking de proveedores{_filter_suffix()}</h3>"
-    hdr_report.value  = f"<h3>Reportes de escenarios{_filter_suffix()}</h3>"
+    hdr_matrix.value  = f"<h3>Matrices (export CSV){_filter_suffix()}</h3>"
 
 
 def _update_weights_sum_label():
@@ -1016,7 +941,6 @@ def reset_after_upload():
     out_original.clear_output()
     out_scores_main.clear_output()
     out_scores_presets.clear_output()
-    report_output.clear_output()
     matrix_report_output.clear_output()
     info_box.clear_output()
 
@@ -1045,7 +969,7 @@ def reset_after_upload():
 def _apply_visibility():
     section_original.layout.display = ''  if toggle_original.value else 'none'
     section_scores.layout.display   = ''  if toggle_scores.value   else 'none'
-    section_report.layout.display   = ''  if toggle_report.value   else 'none'
+    section_matrix.layout.display   = ''  if toggle_matrix.value   else 'none'
 
 
 def _apply_preset_weights(preset_name: str | None):
@@ -1239,18 +1163,6 @@ def _finalize_loaded_dataset(raw: pd.DataFrame, cleaned: pd.DataFrame, source_la
     _init_date_widgets_from_df(cleaned_df)
     _update_original_view()
 
-    shorts = list(getattr(scenario_reporter, "proveedores_short", []))
-    if shorts:
-        providers_a_dd.options = shorts
-        providers_b_dd.options = shorts
-        providers_a_dd.value = shorts[0]
-        providers_b_dd.value = shorts[0]
-    else:
-        providers_a_dd.options = [("(sin datos)", None)]
-        providers_b_dd.options = [("(sin datos)", None)]
-        providers_a_dd.value = None
-        providers_b_dd.value = None
-
     data_source_status.value = f"<small>Fuente actual: <b>{source_label}</b></small>"
 
 
@@ -1360,7 +1272,7 @@ for wdg in (prov_dropdown, zona_radio, cp_text, rango_dropdown,
 def on_toggle_change(_):
     _apply_visibility()
 
-for tg in (toggle_original, toggle_scores, toggle_report):
+for tg in (toggle_original, toggle_scores, toggle_matrix):
     tg.observe(on_toggle_change, names='value')
 
 
@@ -2356,7 +2268,7 @@ ui = w.VBox([
     toggles_grid,
     section_original,
     section_scores,
-    section_report,
+    section_matrix,
 ])
 
 
